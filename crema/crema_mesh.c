@@ -4,6 +4,7 @@
 #include "crema_mesh.h"
 #include "crema_buffer.h"
 
+#include <coreinit/time.h>
 #include <gx2/draw.h>
 #include <gx2r/draw.h>
 #include <stdio.h>
@@ -65,7 +66,11 @@ bool CremaMeshLoad(CremaMesh *mesh, const char *path)
 {
     memset(mesh, 0, sizeof(*mesh));
 
+    // Opening is timed separately from reading: on hardware a small asset is
+    // dominated by the fixed cost of the open, not by the bytes.
+    uint64_t openStart = OSGetSystemTime();
     FILE *fh = fopen(path, "rb");
+    uint64_t openTicks = OSGetSystemTime() - openStart;
     if (!fh) {
         WHBLogPrintf("[mesh] cannot open %s", path);
         return false;
@@ -115,12 +120,16 @@ bool CremaMeshLoad(CremaMesh *mesh, const char *path)
     if (ok)
         ok = CremaBufferCreate(&mesh->ibo, GX2R_RESOURCE_BIND_INDEX_BUFFER,
                                sizeof(uint16_t), h.indexCount, NULL);
+    size_t blobBytes = (size_t)h.stride * h.vertexCount +
+                       (size_t)sizeof(uint16_t) * h.indexCount;
+    uint64_t readStart = OSGetSystemTime();
     if (ok)
         ok = readIntoBuffer(fh, &mesh->vbo, h.vertexOffset,
                             (size_t)h.stride * h.vertexCount);
     if (ok)
         ok = readIntoBuffer(fh, &mesh->ibo, h.indexOffset,
                             (size_t)sizeof(uint16_t) * h.indexCount);
+    uint64_t readTicks = OSGetSystemTime() - readStart;
     fclose(fh);
 
     if (!ok) {
@@ -136,8 +145,13 @@ bool CremaMeshLoad(CremaMesh *mesh, const char *path)
     memcpy(mesh->aabbMin, h.aabbMin, sizeof(mesh->aabbMin));
     memcpy(mesh->aabbMax, h.aabbMax, sizeof(mesh->aabbMax));
 
+    double openMs = (double)OSTicksToMicroseconds(openTicks) / 1000.0;
+    double readMs = (double)OSTicksToMicroseconds(readTicks) / 1000.0;
     WHBLogPrintf("[mesh] %s: %u verts, %u tris, stride %u, %u attribs",
                  path, h.vertexCount, h.indexCount / 3, h.stride, h.attribCount);
+    WHBLogPrintf("[mesh]   open %.2f ms | read %u B in %.2f ms (%.1f MB/s)",
+                 openMs, (uint32_t)blobBytes, readMs,
+                 readMs > 0.0 ? (double)blobBytes / 1000.0 / readMs : 0.0);
     return true;
 }
 

@@ -3,6 +3,7 @@
 
 #include "crema_texture.h"
 
+#include <coreinit/time.h>
 #include <gx2/event.h>
 #include <gx2/mem.h>
 #include <gx2/state.h>
@@ -14,6 +15,7 @@
 #include <whb/log.h>
 
 #define BYTES_PER_PIXEL 4
+#define CREMA_MAX_MIP_LEVELS 14   // a full chain from 8192 down to 1
 
 static uint32_t levelSize(uint32_t base, uint32_t level)
 {
@@ -87,30 +89,49 @@ void CremaTextureDestroy(GX2Texture *tex)
     tex->surface.mipmaps = NULL;
 }
 
-bool CremaTextureUploadLevel(GX2Texture *tex, uint32_t level, const void *rgba8)
+// Queue one level's copy without waiting for it. The staging surface must stay
+// alive until the caller syncs, which is the whole point: a chain uploaded this
+// way costs ONE GX2DrawDone instead of one per level. Measured on hardware, the
+// per-level sync was most of the cost of loading a mipped texture.
+static bool stageLevel(GX2Texture *tex, uint32_t level, const void *rgba8,
+                       GX2Texture *staging)
 {
     uint32_t w = levelSize(tex->surface.width, level);
     uint32_t h = levelSize(tex->surface.height, level);
 
     // Linear staging copy: the CPU can only write a row-major image, the GPU
     // does the swizzling for us in GX2CopySurface.
-    GX2Texture staging;
-    if (!CremaTextureCreate(&staging, w, h, 1, GX2_TILE_MODE_LINEAR_ALIGNED))
+    if (!CremaTextureCreate(staging, w, h, 1, GX2_TILE_MODE_LINEAR_ALIGNED))
         return false;
 
     const uint8_t *src = (const uint8_t *)rgba8;
-    uint8_t *dst = (uint8_t *)staging.surface.image;
+    uint8_t *dst = (uint8_t *)staging->surface.image;
     for (uint32_t y = 0; y < h; y++)
-        memcpy(dst + (size_t)y * staging.surface.pitch * BYTES_PER_PIXEL,
+        memcpy(dst + (size_t)y * staging->surface.pitch * BYTES_PER_PIXEL,
                src + (size_t)y * w * BYTES_PER_PIXEL,
                (size_t)w * BYTES_PER_PIXEL);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
-                  staging.surface.image, staging.surface.imageSize);
+                  staging->surface.image, staging->surface.imageSize);
 
-    GX2CopySurface(&staging.surface, 0, 0, &tex->surface, level, 0);
+    GX2CopySurface(&staging->surface, 0, 0, &tex->surface, level, 0);
+    return true;
+}
+
+// Let every queued copy land, then release the staging surfaces.
+static void settleStaging(GX2Texture *staging, uint32_t count)
+{
     GX2Flush();
-    GX2DrawDone();   // staging dies at the end of this call: let the copy land
-    CremaTextureDestroy(&staging);
+    GX2DrawDone();
+    for (uint32_t i = 0; i < count; i++)
+        CremaTextureDestroy(&staging[i]);
+}
+
+bool CremaTextureUploadLevel(GX2Texture *tex, uint32_t level, const void *rgba8)
+{
+    GX2Texture staging;
+    if (!stageLevel(tex, level, rgba8, &staging))
+        return false;
+    settleStaging(&staging, 1);
     return true;
 }
 
@@ -142,21 +163,28 @@ static void boxReduce(const uint8_t *src, uint32_t sw, uint32_t sh, uint8_t *dst
 
 bool CremaTextureUploadWithMips(GX2Texture *tex, const void *rgba8)
 {
-    if (!CremaTextureUploadLevel(tex, 0, rgba8))
-        return false;
-
     uint32_t levels = tex->surface.mipLevels;
-    if (levels <= 1)
-        return true;
+    if (levels > CREMA_MAX_MIP_LEVELS)
+        levels = CREMA_MAX_MIP_LEVELS;
+
+    // Every level's staging surface stays alive until the single sync below.
+    GX2Texture staging[CREMA_MAX_MIP_LEVELS];
+    uint32_t staged = 0;
+
+    bool ok = stageLevel(tex, 0, rgba8, &staging[staged]);
+    if (ok)
+        staged++;
 
     uint32_t sw = tex->surface.width;
     uint32_t sh = tex->surface.height;
-    uint8_t *src = (uint8_t *)malloc((size_t)sw * sh * BYTES_PER_PIXEL);
-    if (!src)
-        return false;
-    memcpy(src, rgba8, (size_t)sw * sh * BYTES_PER_PIXEL);
+    uint8_t *src = NULL;
+    if (ok && levels > 1) {
+        src = (uint8_t *)malloc((size_t)sw * sh * BYTES_PER_PIXEL);
+        ok = src != NULL;
+        if (ok)
+            memcpy(src, rgba8, (size_t)sw * sh * BYTES_PER_PIXEL);
+    }
 
-    bool ok = true;
     for (uint32_t l = 1; l < levels && ok; l++) {
         uint32_t dw = levelSize(tex->surface.width, l);
         uint32_t dh = levelSize(tex->surface.height, l);
@@ -166,13 +194,17 @@ bool CremaTextureUploadWithMips(GX2Texture *tex, const void *rgba8)
             break;
         }
         boxReduce(src, sw, sh, dst);
-        ok = CremaTextureUploadLevel(tex, l, dst);
+        ok = stageLevel(tex, l, dst, &staging[staged]);
+        if (ok)
+            staged++;
         free(src);
         src = dst;
         sw = dw;
         sh = dh;
     }
     free(src);
+
+    settleStaging(staging, staged);
     if (ok)
         WHBLogPrintf("[texture] %ux%u uploaded, %u mip levels",
                      tex->surface.width, tex->surface.height, levels);
@@ -220,8 +252,19 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
     if (ok && fseek(fh, (long)h.dataOffset, SEEK_SET) != 0)
         ok = false;
 
+    uint32_t levels = h.mipLevels;
+    if (levels > CREMA_MAX_MIP_LEVELS)
+        levels = CREMA_MAX_MIP_LEVELS;
+
     // Levels are already box-filtered offline, so this is pure I/O + upload.
-    for (uint32_t level = 0; level < h.mipLevels && ok; level++) {
+    // Timed apart, because "how long does an asset take to load" is a useless
+    // number if you cannot tell reading from uploading.
+    GX2Texture staging[CREMA_MAX_MIP_LEVELS];
+    uint32_t staged = 0;
+    uint64_t readTicks = 0, stageTicks = 0;
+    size_t readBytes = 0;
+
+    for (uint32_t level = 0; level < levels && ok; level++) {
         uint32_t w = levelSize(h.width, level);
         uint32_t d = levelSize(h.height, level);
         size_t bytes = (size_t)w * d * BYTES_PER_PIXEL;
@@ -230,11 +273,24 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
             ok = false;
             break;
         }
-        ok = fread(scratch, 1, bytes, fh) == bytes &&
-             CremaTextureUploadLevel(tex, level, scratch);
+        uint64_t t0 = OSGetSystemTime();
+        ok = fread(scratch, 1, bytes, fh) == bytes;
+        uint64_t t1 = OSGetSystemTime();
+        readTicks += t1 - t0;
+        readBytes += bytes;
+        if (ok) {
+            ok = stageLevel(tex, level, scratch, &staging[staged]);
+            if (ok)
+                staged++;
+            stageTicks += OSGetSystemTime() - t1;
+        }
         free(scratch);
     }
     fclose(fh);
+
+    uint64_t syncStart = OSGetSystemTime();
+    settleStaging(staging, staged);
+    uint64_t syncTicks = OSGetSystemTime() - syncStart;
 
     if (!ok) {
         WHBLogPrintf("[texture] %s: truncated or unreadable", path);
@@ -242,8 +298,14 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
         return false;
     }
 
-    WHBLogPrintf("[texture] %s: %ux%u, %u mip levels",
-                 path, h.width, h.height, h.mipLevels);
+    double readMs  = (double)OSTicksToMicroseconds(readTicks) / 1000.0;
+    double stageMs = (double)OSTicksToMicroseconds(stageTicks) / 1000.0;
+    double syncMs  = (double)OSTicksToMicroseconds(syncTicks) / 1000.0;
+    WHBLogPrintf("[texture] %s: %ux%u, %u levels, %u KB", path, h.width,
+                 h.height, levels, (uint32_t)(readBytes / 1024));
+    WHBLogPrintf("[texture]   read %.2f ms (%.1f MB/s) | stage %.2f ms | sync %.2f ms",
+                 readMs, readMs > 0.0 ? (double)readBytes / 1000.0 / readMs : 0.0,
+                 stageMs, syncMs);
     return true;
 }
 

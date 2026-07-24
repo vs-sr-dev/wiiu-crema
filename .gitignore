@@ -3,3 +3,4 @@ external/glslcompiler.rpl
 *.wuhb
 *.rpx
 *.elf
+*.log

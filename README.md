@@ -58,7 +58,7 @@ while (CremaAppRunning()) {
 | 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **1.67 Gpix/s** flat fill |
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
-| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | Cemu-verified, HW pending |
+| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 48 ms |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -94,8 +94,15 @@ against the mesh centre, the obvious version, lies about wings and any flat
 part sitting off-centre. Ours caught seven inside-out solids on the first run.)
 
 Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
-read from `/vol/content/`. Load timing is measured and logged, but the Cemu
-number says nothing about the console — that one waits for hardware.
+read from `/vol/content/` — confirmed working on real hardware under Aroma, not
+just in Cemu.
+
+**Measured on console:** 356 KB of assets (a 14.6 KB mesh + a 350 KB mipped
+texture) load in **48 ms**. Read that as wall-clock, not as SD throughput: the
+texture path pays a `GX2CopySurface` plus a full `GX2DrawDone` per mip level,
+nine of them here. The split is the interesting part — the 350 KB texture took
+~43 ms while the 14.6 KB mesh still cost ~5 ms, so **a fixed per-file overhead
+dominates small assets**. Many small files is the wrong shape; pack them.
 
 ## Lessons learned (Cemu vs real hardware)
 

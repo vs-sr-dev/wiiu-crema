@@ -8,6 +8,7 @@
 #include <gx2/state.h>
 #include <gx2/surface.h>
 #include <malloc.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <whb/log.h>
@@ -176,6 +177,74 @@ bool CremaTextureUploadWithMips(GX2Texture *tex, const void *rgba8)
         WHBLogPrintf("[texture] %ux%u uploaded, %u mip levels",
                      tex->surface.width, tex->surface.height, levels);
     return ok;
+}
+
+// --- baked textures ----------------------------------------------------------
+
+// Mirrors tools/crema_bake.py. File and CPU are both big-endian: fread is enough.
+typedef struct {
+    char     magic[4];
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t mipLevels;
+    uint32_t format;      // 1 = RGBA8
+    uint32_t dataOffset;
+    uint32_t reserved;
+} TexHeader;
+_Static_assert(sizeof(TexHeader) == 32, "ctex header must stay 32 bytes");
+
+#define CTEX_VERSION 1
+#define CTEX_FORMAT_RGBA8 1
+
+bool CremaTextureLoad(GX2Texture *tex, const char *path)
+{
+    memset(tex, 0, sizeof(*tex));
+
+    FILE *fh = fopen(path, "rb");
+    if (!fh) {
+        WHBLogPrintf("[texture] cannot open %s", path);
+        return false;
+    }
+
+    TexHeader h;
+    bool ok = fread(&h, 1, sizeof(h), fh) == sizeof(h);
+    if (ok && (memcmp(h.magic, "CTEX", 4) != 0 || h.version != CTEX_VERSION ||
+               h.format != CTEX_FORMAT_RGBA8)) {
+        WHBLogPrintf("[texture] %s: not a v%d RGBA8 .ctex", path, CTEX_VERSION);
+        ok = false;
+    }
+    if (ok)
+        ok = CremaTextureCreate(tex, h.width, h.height, h.mipLevels,
+                                GX2_TILE_MODE_DEFAULT);
+    if (ok && fseek(fh, (long)h.dataOffset, SEEK_SET) != 0)
+        ok = false;
+
+    // Levels are already box-filtered offline, so this is pure I/O + upload.
+    for (uint32_t level = 0; level < h.mipLevels && ok; level++) {
+        uint32_t w = levelSize(h.width, level);
+        uint32_t d = levelSize(h.height, level);
+        size_t bytes = (size_t)w * d * BYTES_PER_PIXEL;
+        uint8_t *scratch = (uint8_t *)malloc(bytes);
+        if (!scratch) {
+            ok = false;
+            break;
+        }
+        ok = fread(scratch, 1, bytes, fh) == bytes &&
+             CremaTextureUploadLevel(tex, level, scratch);
+        free(scratch);
+    }
+    fclose(fh);
+
+    if (!ok) {
+        WHBLogPrintf("[texture] %s: truncated or unreadable", path);
+        CremaTextureDestroy(tex);
+        return false;
+    }
+
+    WHBLogPrintf("[texture] %s: %ux%u, %u mip levels",
+                 path, h.width, h.height, h.mipLevels);
+    return true;
 }
 
 void CremaSamplerInitTrilinear(GX2Sampler *sampler, GX2TexClampMode clampMode)

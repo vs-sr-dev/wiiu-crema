@@ -38,6 +38,11 @@ bool CremaTextureUploadLevel(GX2Texture *tex, uint32_t level, const void *rgba8)
 // Upload level 0 and box-filter the rest of the chain from it.
 bool CremaTextureUploadWithMips(GX2Texture *tex, const void *rgba8);
 
+// Load a baked .ctex (tools/crema_bake.py texture ...): creates the surface
+// and uploads every mip level, all of them filtered offline. Paths inside a
+// .wuhb live under /vol/content/.
+bool CremaTextureLoad(GX2Texture *tex, const char *path);
+
 void CremaTextureDestroy(GX2Texture *tex);
 
 // Bilinear within a level + linear between levels — what a mip chain is for.

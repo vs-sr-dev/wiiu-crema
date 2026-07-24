@@ -28,6 +28,8 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   fenced pipelining at vsync, fenced uncapped for benchmarks), TV+GamePad
   presentation, and the double-buffered `CremaUniformRing` that makes writing
   next frame's uniforms safe while the GPU still reads the last one
+- **crema_mesh** — baked `.cmesh` loading: no parsing, no byteswap, file bytes
+  read straight into GPU buffers, and the file describes its own vertex layout
 - **crema_matrix** — column-major mat4/vec3 math, GL conventions
 
 The whole engine-grade frame is four calls — this is [poc9](examples/poc9-scene/main.cpp)
@@ -56,9 +58,44 @@ while (CremaAppRunning()) {
 | 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **1.67 Gpix/s** flat fill |
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
+| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | Cemu-verified, HW pending |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
+
+## The asset pipeline (`tools/`)
+
+Everything up to PoC 9 generated its geometry in code. PoC 10 loads it, and the
+split is deliberate: **all the thinking happens offline, on the PC.**
+
+```sh
+python tools/gen_ship.py  examples/poc10-mesh/assets          # the example asset
+python tools/crema_bake.py mesh    assets/ship.obj content/ship.cmesh
+python tools/crema_bake.py texture assets/hull.png content/hull.ctex
+```
+
+The baker interleaves vertices into the exact layout the fetch shader wants,
+builds the mip chain, and writes everything **big-endian** — which is the
+console's native order. So `CremaMeshLoad` parses nothing and converts nothing:
+it `fread`s the blobs straight into GX2R buffers. The file also carries its own
+attribute table, which is handed to the shader compiler, so the program never
+hard-codes a vertex layout:
+
+```c
+CremaMeshLoad(&ship, "/vol/content/ship.cmesh");
+shader = CremaShaderCompile(VS, PS, ship.attribs, ship.attribCount);
+```
+
+The baker also *checks* the model, because back-face culling turns a winding
+mistake into a see-through ship: it splits the mesh into connected components,
+verifies each one is closed, and takes the signed volume — positive exactly
+when a closed surface faces outwards, whatever its shape. (Comparing normals
+against the mesh centre, the obvious version, lies about wings and any flat
+part sitting off-centre. Ours caught seven inside-out solids on the first run.)
+
+Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
+read from `/vol/content/`. Load timing is measured and logged, but the Cemu
+number says nothing about the console — that one waits for hardware.
 
 ## Lessons learned (Cemu vs real hardware)
 

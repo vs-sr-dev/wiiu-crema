@@ -9,6 +9,7 @@ add_library(crema STATIC
     crema/crema_app.c
     crema/crema_buffer.c
     crema/crema_frame.c
+    crema/crema_mesh.c
     crema/crema_shader.cpp
     crema/crema_texture.c
 )
@@ -23,3 +24,4 @@ add_subdirectory(examples/poc6-engine)
 add_subdirectory(examples/poc7-fillrate)
 add_subdirectory(examples/poc8-fence)
 add_subdirectory(examples/poc9-scene)
+add_subdirectory(examples/poc10-mesh)

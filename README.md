@@ -97,26 +97,40 @@ Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
 read from `/vol/content/` — confirmed working on real hardware under Aroma, not
 just in Cemu.
 
-**Measured on console** (Aroma, SD card), loading a 14.5 KB mesh and a 341 KB
-mipped texture — 49 ms in total, split as:
+### What loading actually costs (measured on console)
 
-| stage | time | rate |
-|---|---|---|
-| mesh: `fopen` | 0.14 ms | — |
-| mesh: 2 reads, 14.5 KB | 2.21 ms | 6.6 MB/s |
-| texture: 9 reads, 341 KB | 28.94 ms | 12.1 MB/s |
-| texture: staging + `GX2CopySurface` ×9 | 5.73 ms | — |
-| texture: one final `GX2DrawDone` | 0.26 ms | — |
+Loading a 14.5 KB mesh and a 341 KB mipped texture from the SD card under
+Aroma, instrumented until the accounting closed:
 
-**Loading is I/O-bound, and the shape of the I/O matters more than its volume.**
-Two reads of 13 KB and 1.3 KB cost the same 1.1 ms each, so the cost is roughly
-**fixed per call, about 1 ms** — which is why the nine-read texture measures
-12 MB/s while its bytes probably move nearer 17. Few big reads beat many small
-ones, and packing assets into one archive beats opening many files.
+| operation | cost |
+|---|---|
+| `fopen` | ~0.15 ms |
+| **first read on a stream** | **~3–4 ms, whatever its size** |
+| each read after that | ~0.74 ms fixed |
+| the bytes themselves | 15–18 MB/s |
+| staging + `GX2CopySurface` for a 341 KB mip chain | ~3.7 ms |
+| one `GX2DrawDone` for the whole chain | ~0.25 ms |
 
-Waiting for the GPU, by contrast, is free here: the whole mip chain settles in
-0.26 ms. We batched those nine syncs into one expecting to save real time and
-saved nothing measurable — the instrumentation was the part that paid off.
+That first-read figure is not a typo: **64 bytes cost 3.09 ms** because it is
+the read that makes stdio set the stream up, and every filesystem call here is
+a round trip to IOSU. Reading 14 KB from the same warm stream then costs 2.28.
+
+So the cost of an asset is dominated by *touching its file at all*, not by its
+size — more than half the load time of our 14.5 KB mesh is stream setup. Twenty
+assets in twenty files would burn ~80 ms before reading anything useful. One
+archive, one open, few big reads.
+
+Applying that took the same two assets from **49 ms to 36 ms (−28%)** without
+changing a byte of content: one read for a whole mip chain instead of nine, and
+no zeroing of surfaces that are about to be overwritten (the `memset` was
+costing more than every GPU wait combined). Keep the `GX2Invalidate` when you
+drop the `memset` — the allocation may hold dirty cache lines from its previous
+owner, and lesson 3 above is what happens if they flush late.
+
+The one thing that turned out not to matter: waiting for the GPU. We batched
+nine per-level syncs into one expecting to save real time and saved nothing
+measurable — those copies are tiny and the GPU is idle. The instrumentation was
+the part that paid off, not the optimisation it shipped with.
 
 ## Lessons learned (Cemu vs real hardware)
 

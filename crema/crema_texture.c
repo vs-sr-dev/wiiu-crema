@@ -34,8 +34,13 @@ uint32_t CremaTextureMipLevels(uint32_t width, uint32_t height)
     return levels;
 }
 
-bool CremaTextureCreate(GX2Texture *tex, uint32_t width, uint32_t height,
-                        uint32_t mipLevels, GX2TileMode tileMode)
+// `clear` zeroes the surface. Skip it when every byte is about to be
+// overwritten — but never skip the GX2Invalidate that follows: the allocation
+// may carry dirty cache lines from whatever owned that memory before, and
+// those would flush over the GPU's work later. That is the PoC 7 bug, and it
+// only ever shows up on hardware.
+static bool createSurface(GX2Texture *tex, uint32_t width, uint32_t height,
+                          uint32_t mipLevels, GX2TileMode tileMode, bool clear)
 {
     memset(tex, 0, sizeof(*tex));
     tex->surface.width     = width;
@@ -59,7 +64,8 @@ bool CremaTextureCreate(GX2Texture *tex, uint32_t width, uint32_t height,
                      width, height, tex->surface.imageSize);
         return false;
     }
-    memset(tex->surface.image, 0, tex->surface.imageSize);
+    if (clear)
+        memset(tex->surface.image, 0, tex->surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
                   tex->surface.image, tex->surface.imageSize);
 
@@ -74,11 +80,18 @@ bool CremaTextureCreate(GX2Texture *tex, uint32_t width, uint32_t height,
             tex->surface.image = NULL;
             return false;
         }
-        memset(tex->surface.mipmaps, 0, tex->surface.mipmapSize);
+        if (clear)
+            memset(tex->surface.mipmaps, 0, tex->surface.mipmapSize);
         GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
                       tex->surface.mipmaps, tex->surface.mipmapSize);
     }
     return true;
+}
+
+bool CremaTextureCreate(GX2Texture *tex, uint32_t width, uint32_t height,
+                        uint32_t mipLevels, GX2TileMode tileMode)
+{
+    return createSurface(tex, width, height, mipLevels, tileMode, true);
 }
 
 void CremaTextureDestroy(GX2Texture *tex)
@@ -100,8 +113,9 @@ static bool stageLevel(GX2Texture *tex, uint32_t level, const void *rgba8,
     uint32_t h = levelSize(tex->surface.height, level);
 
     // Linear staging copy: the CPU can only write a row-major image, the GPU
-    // does the swizzling for us in GX2CopySurface.
-    if (!CremaTextureCreate(staging, w, h, 1, GX2_TILE_MODE_LINEAR_ALIGNED))
+    // does the swizzling for us in GX2CopySurface. No need to zero it — every
+    // row is written below, and the pitch padding is never sampled.
+    if (!createSurface(staging, w, h, 1, GX2_TILE_MODE_LINEAR_ALIGNED, false))
         return false;
 
     const uint8_t *src = (const uint8_t *)rgba8;
@@ -233,6 +247,7 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
 {
     memset(tex, 0, sizeof(*tex));
 
+    uint64_t openStart = OSGetSystemTime();
     FILE *fh = fopen(path, "rb");
     if (!fh) {
         WHBLogPrintf("[texture] cannot open %s", path);
@@ -241,14 +256,19 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
 
     TexHeader h;
     bool ok = fread(&h, 1, sizeof(h), fh) == sizeof(h);
+    uint64_t openTicks = OSGetSystemTime() - openStart;   // open + header read
     if (ok && (memcmp(h.magic, "CTEX", 4) != 0 || h.version != CTEX_VERSION ||
                h.format != CTEX_FORMAT_RGBA8)) {
         WHBLogPrintf("[texture] %s: not a v%d RGBA8 .ctex", path, CTEX_VERSION);
         ok = false;
     }
+    // Every level is uploaded below, so there is nothing to gain from zeroing
+    // half a megabyte first.
+    uint64_t createStart = OSGetSystemTime();
     if (ok)
-        ok = CremaTextureCreate(tex, h.width, h.height, h.mipLevels,
-                                GX2_TILE_MODE_DEFAULT);
+        ok = createSurface(tex, h.width, h.height, h.mipLevels,
+                           GX2_TILE_MODE_DEFAULT, false);
+    uint64_t createTicks = OSGetSystemTime() - createStart;
     if (ok && fseek(fh, (long)h.dataOffset, SEEK_SET) != 0)
         ok = false;
 
@@ -259,32 +279,69 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
     // Levels are already box-filtered offline, so this is pure I/O + upload.
     // Timed apart, because "how long does an asset take to load" is a useless
     // number if you cannot tell reading from uploading.
+    //
+    // One read for the whole chain, not one per level: on hardware a file read
+    // costs about 1.1 ms whatever its size, so nine reads spend most of their
+    // time in fixed overhead. The tail of a mip chain is tiny — the last six
+    // levels of a 256x256 texture are 1.4 KB together, and paying a millisecond
+    // each for them is absurd.
     GX2Texture staging[CREMA_MAX_MIP_LEVELS];
     uint32_t staged = 0;
     uint64_t readTicks = 0, stageTicks = 0;
     size_t readBytes = 0;
+    uint32_t readCalls = 0;
+    for (uint32_t level = 0; level < levels; level++)
+        readBytes += (size_t)levelSize(h.width, level) *
+                     levelSize(h.height, level) * BYTES_PER_PIXEL;
 
-    for (uint32_t level = 0; level < levels && ok; level++) {
-        uint32_t w = levelSize(h.width, level);
-        uint32_t d = levelSize(h.height, level);
-        size_t bytes = (size_t)w * d * BYTES_PER_PIXEL;
-        uint8_t *scratch = (uint8_t *)malloc(bytes);
-        if (!scratch) {
-            ok = false;
-            break;
-        }
+    uint8_t *blob = ok ? (uint8_t *)malloc(readBytes) : NULL;
+    if (ok && !blob) {
+        // A full chain is ~4/3 of the top level; if that will not fit, fall
+        // back to reading level by level and pay the per-call cost.
+        WHBLogPrintf("[texture] %s: %u KB blob did not fit, reading per level",
+                     path, (uint32_t)(readBytes / 1024));
+    }
+
+    if (ok && blob) {
         uint64_t t0 = OSGetSystemTime();
-        ok = fread(scratch, 1, bytes, fh) == bytes;
-        uint64_t t1 = OSGetSystemTime();
-        readTicks += t1 - t0;
-        readBytes += bytes;
-        if (ok) {
-            ok = stageLevel(tex, level, scratch, &staging[staged]);
+        ok = fread(blob, 1, readBytes, fh) == readBytes;
+        readTicks = OSGetSystemTime() - t0;
+        readCalls = 1;
+
+        size_t offset = 0;
+        for (uint32_t level = 0; level < levels && ok; level++) {
+            uint64_t t1 = OSGetSystemTime();
+            ok = stageLevel(tex, level, blob + offset, &staging[staged]);
             if (ok)
                 staged++;
             stageTicks += OSGetSystemTime() - t1;
+            offset += (size_t)levelSize(h.width, level) *
+                      levelSize(h.height, level) * BYTES_PER_PIXEL;
         }
-        free(scratch);
+        free(blob);
+    } else if (ok) {
+        for (uint32_t level = 0; level < levels && ok; level++) {
+            uint32_t w = levelSize(h.width, level);
+            uint32_t d = levelSize(h.height, level);
+            size_t bytes = (size_t)w * d * BYTES_PER_PIXEL;
+            uint8_t *scratch = (uint8_t *)malloc(bytes);
+            if (!scratch) {
+                ok = false;
+                break;
+            }
+            uint64_t t0 = OSGetSystemTime();
+            ok = fread(scratch, 1, bytes, fh) == bytes;
+            uint64_t t1 = OSGetSystemTime();
+            readTicks += t1 - t0;
+            readCalls++;
+            if (ok) {
+                ok = stageLevel(tex, level, scratch, &staging[staged]);
+                if (ok)
+                    staged++;
+                stageTicks += OSGetSystemTime() - t1;
+            }
+            free(scratch);
+        }
     }
     fclose(fh);
 
@@ -303,9 +360,14 @@ bool CremaTextureLoad(GX2Texture *tex, const char *path)
     double syncMs  = (double)OSTicksToMicroseconds(syncTicks) / 1000.0;
     WHBLogPrintf("[texture] %s: %ux%u, %u levels, %u KB", path, h.width,
                  h.height, levels, (uint32_t)(readBytes / 1024));
-    WHBLogPrintf("[texture]   read %.2f ms (%.1f MB/s) | stage %.2f ms | sync %.2f ms",
-                 readMs, readMs > 0.0 ? (double)readBytes / 1000.0 / readMs : 0.0,
-                 stageMs, syncMs);
+    double openMs   = (double)OSTicksToMicroseconds(openTicks) / 1000.0;
+    double createMs = (double)OSTicksToMicroseconds(createTicks) / 1000.0;
+    WHBLogPrintf("[texture]   open+hdr %.2f ms | create %.2f ms | read %.2f ms in %u call(s) (%.1f MB/s)",
+                 openMs, createMs, readMs, readCalls,
+                 readMs > 0.0 ? (double)readBytes / 1000.0 / readMs : 0.0);
+    WHBLogPrintf("[texture]   stage %.2f ms | sync %.2f ms | accounted %.2f ms",
+                 stageMs, syncMs,
+                 openMs + createMs + readMs + stageMs + syncMs);
     return true;
 }
 

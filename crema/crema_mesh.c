@@ -76,8 +76,13 @@ bool CremaMeshLoad(CremaMesh *mesh, const char *path)
         return false;
     }
 
+    // Timed on its own: 64 bytes, but it is the FIRST read on the stream, and
+    // that is where stdio does its setup. On hardware this dwarfs the reads
+    // that follow — the cost of touching a file at all.
+    uint64_t headerStart = OSGetSystemTime();
     MeshHeader h;
     bool ok = fread(&h, 1, sizeof(h), fh) == sizeof(h);
+    uint64_t headerTicks = OSGetSystemTime() - headerStart;
     if (ok && memcmp(h.magic, "CMSH", 4) != 0) {
         WHBLogPrintf("[mesh] %s is not a .cmesh", path);
         ok = false;
@@ -149,8 +154,9 @@ bool CremaMeshLoad(CremaMesh *mesh, const char *path)
     double readMs = (double)OSTicksToMicroseconds(readTicks) / 1000.0;
     WHBLogPrintf("[mesh] %s: %u verts, %u tris, stride %u, %u attribs",
                  path, h.vertexCount, h.indexCount / 3, h.stride, h.attribCount);
-    WHBLogPrintf("[mesh]   open %.2f ms | read %u B in %.2f ms (%.1f MB/s)",
-                 openMs, (uint32_t)blobBytes, readMs,
+    WHBLogPrintf("[mesh]   open %.2f ms | header(1st read) %.2f ms | read %u B in %.2f ms (%.1f MB/s)",
+                 openMs, (double)OSTicksToMicroseconds(headerTicks) / 1000.0,
+                 (uint32_t)blobBytes, readMs,
                  readMs > 0.0 ? (double)blobBytes / 1000.0 / readMs : 0.0);
     return true;
 }

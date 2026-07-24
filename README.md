@@ -97,12 +97,26 @@ Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
 read from `/vol/content/` — confirmed working on real hardware under Aroma, not
 just in Cemu.
 
-**Measured on console:** 356 KB of assets (a 14.6 KB mesh + a 350 KB mipped
-texture) load in **48 ms**. Read that as wall-clock, not as SD throughput: the
-texture path pays a `GX2CopySurface` plus a full `GX2DrawDone` per mip level,
-nine of them here. The split is the interesting part — the 350 KB texture took
-~43 ms while the 14.6 KB mesh still cost ~5 ms, so **a fixed per-file overhead
-dominates small assets**. Many small files is the wrong shape; pack them.
+**Measured on console** (Aroma, SD card), loading a 14.5 KB mesh and a 341 KB
+mipped texture — 49 ms in total, split as:
+
+| stage | time | rate |
+|---|---|---|
+| mesh: `fopen` | 0.14 ms | — |
+| mesh: 2 reads, 14.5 KB | 2.21 ms | 6.6 MB/s |
+| texture: 9 reads, 341 KB | 28.94 ms | 12.1 MB/s |
+| texture: staging + `GX2CopySurface` ×9 | 5.73 ms | — |
+| texture: one final `GX2DrawDone` | 0.26 ms | — |
+
+**Loading is I/O-bound, and the shape of the I/O matters more than its volume.**
+Two reads of 13 KB and 1.3 KB cost the same 1.1 ms each, so the cost is roughly
+**fixed per call, about 1 ms** — which is why the nine-read texture measures
+12 MB/s while its bytes probably move nearer 17. Few big reads beat many small
+ones, and packing assets into one archive beats opening many files.
+
+Waiting for the GPU, by contrast, is free here: the whole mip chain settles in
+0.26 ms. We batched those nine syncs into one expecting to save real time and
+saved nothing measurable — the instrumentation was the part that paid off.
 
 ## Lessons learned (Cemu vs real hardware)
 

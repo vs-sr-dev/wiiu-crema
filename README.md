@@ -19,7 +19,29 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   [CafeGLSL](https://github.com/Exzap/CafeGLSL), fetch-shader construction,
   VS/PS uniform-block reflection, big-endian-safe uniform upload
   (`CremaUniformStore` byteswaps + invalidates — the GPU reads LE)
+- **crema_buffer** — GX2R vertex/index buffers: create, upload, destroy, with
+  the cache maintenance the lock/unlock pair implies
+- **crema_texture** — RGBA8 textures, CPU box-filtered mip chains, per-level
+  upload through a linear staging surface + `GX2CopySurface` (works for any
+  tile mode), trilinear sampler setup
+- **crema_frame** — frame pacing in three flavours (`GX2DrawDone` per frame,
+  fenced pipelining at vsync, fenced uncapped for benchmarks), TV+GamePad
+  presentation, and the double-buffered `CremaUniformRing` that makes writing
+  next frame's uniforms safe while the GPU still reads the last one
 - **crema_matrix** — column-major mat4/vec3 math, GL conventions
+
+The whole engine-grade frame is four calls — this is [poc9](examples/poc9-scene/main.cpp)
+in full:
+
+```c
+CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);   // vsync, 2 frames in flight
+while (CremaAppRunning()) {
+    uint32_t slot = CremaFrameBegin(&frame);      // waits on frame N-2 only
+    view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
+    CremaFrameDrawBoth(SKY, drawScene, &view);    // TV + GamePad
+    CremaFrameEnd(&frame, &stats);                // swap, flush, fence
+}
+```
 
 ## The examples (`examples/`)
 

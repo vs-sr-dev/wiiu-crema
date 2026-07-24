@@ -7,7 +7,10 @@ project(crema C CXX)
 # Sits on top of Espresso and Latte, like any good crema should.
 add_library(crema STATIC
     crema/crema_app.c
+    crema/crema_buffer.c
+    crema/crema_frame.c
     crema/crema_shader.cpp
+    crema/crema_texture.c
 )
 target_include_directories(crema PUBLIC crema external)
 

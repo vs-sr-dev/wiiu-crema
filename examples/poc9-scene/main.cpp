@@ -32,8 +32,11 @@
 #include <math.h>
 
 #include "crema_app.h"
-#include "crema_shader.h"
+#include "crema_buffer.h"
+#include "crema_frame.h"
 #include "crema_matrix.h"
+#include "crema_shader.h"
+#include "crema_texture.h"
 
 // --- shaders -----------------------------------------------------------------
 
@@ -132,7 +135,6 @@ static const char *PS_OBJECTS =
 #define NUM_OBJECTS 256
 #define GROUND_HALF 200.0f
 #define GROUND_UV   80.0f
-#define GLOBAL_SLICE 256
 
 static void buildTorus(float *verts, uint16_t *indices, float R, float r)
 {
@@ -192,60 +194,6 @@ static void fillGroundTexture(uint8_t *dst, uint32_t pitchPixels)
     }
 }
 
-static bool createTexture(GX2Texture *tex, GX2TileMode tileMode,
-                          uint32_t size, uint32_t mipLevels)
-{
-    memset(tex, 0, sizeof(*tex));
-    tex->surface.width     = size;
-    tex->surface.height    = size;
-    tex->surface.depth     = 1;
-    tex->surface.mipLevels = mipLevels;
-    tex->surface.format    = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
-    tex->surface.aa        = GX2_AA_MODE1X;
-    tex->surface.use       = GX2_SURFACE_USE_TEXTURE;
-    tex->surface.dim       = GX2_SURFACE_DIM_TEXTURE_2D;
-    tex->surface.tileMode  = tileMode;
-    tex->viewNumMips   = mipLevels;
-    tex->viewNumSlices = 1;
-    tex->compMap       = 0x00010203;
-    GX2CalcSurfaceSizeAndAlignment(&tex->surface);
-    GX2InitTextureRegs(tex);
-    tex->surface.image = memalign(tex->surface.alignment, tex->surface.imageSize);
-    if (!tex->surface.image)
-        return false;
-    memset(tex->surface.image, 0, tex->surface.imageSize);
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
-                  tex->surface.image, tex->surface.imageSize);
-    if (tex->surface.mipmapSize > 0) {
-        tex->surface.mipmaps = memalign(tex->surface.alignment,
-                                        tex->surface.mipmapSize);
-        if (!tex->surface.mipmaps)
-            return false;
-        memset(tex->surface.mipmaps, 0, tex->surface.mipmapSize);
-        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
-                      tex->surface.mipmaps, tex->surface.mipmapSize);
-    }
-    return true;
-}
-
-// 2x2 box filter: src (size x size, tightly packed RGBA) -> dst (size/2)
-static void mipReduce(const uint8_t *src, uint8_t *dst, uint32_t srcSize)
-{
-    uint32_t dstSize = srcSize / 2;
-    for (uint32_t y = 0; y < dstSize; y++) {
-        for (uint32_t x = 0; x < dstSize; x++) {
-            for (int c = 0; c < 4; c++) {
-                uint32_t sum =
-                    src[((2*y)   * srcSize + 2*x)   * 4 + c] +
-                    src[((2*y)   * srcSize + 2*x+1) * 4 + c] +
-                    src[((2*y+1) * srcSize + 2*x)   * 4 + c] +
-                    src[((2*y+1) * srcSize + 2*x+1) * 4 + c];
-                dst[(y * dstSize + x) * 4 + c] = (uint8_t)(sum / 4);
-            }
-        }
-    }
-}
-
 typedef struct {
     Mat4  viewProj;
     float lightDir[4];
@@ -255,52 +203,46 @@ typedef struct {
     float time[4];
 } GlobalBlock;
 
-static GX2RBuffer makeBuffer(GX2RResourceFlags bind, uint32_t elemSize,
-                             uint32_t elemCount, const void *data)
-{
-    GX2RBuffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.flags = (GX2RResourceFlags)(bind |
-                                    GX2R_RESOURCE_USAGE_CPU_WRITE |
-                                    GX2R_RESOURCE_USAGE_GPU_READ);
-    buf.elemSize  = elemSize;
-    buf.elemCount = elemCount;
-    GX2RCreateBuffer(&buf);
-    void *p = GX2RLockBufferEx(&buf, (GX2RResourceFlags)0);
-    memcpy(p, data, (size_t)elemSize * elemCount);
-    GX2RUnlockBufferEx(&buf, (GX2RResourceFlags)0);
-    return buf;
-}
+// Everything the per-screen draw needs; CremaFrameDrawBoth replays it once for
+// the TV and once for the GamePad.
+typedef struct {
+    const CremaShader *shGround;
+    const CremaShader *shObjects;
+    GX2RBuffer *groundVbo, *groundIbo;
+    GX2RBuffer *torusVbo,  *torusIbo;
+    const GX2Texture *tex;
+    const GX2Sampler *sampler;
+    uint32_t texUnit;
+    int32_t  gLocG, gLocO, objLoc;      // vertex-shader block bindings
+    int32_t  gPsLocG, gPsLocO;          // pixel-shader block bindings (fog)
+    const void *globalUbo;
+    const void *objArray;
+    size_t   objBytes;
+} SceneView;
 
-static void drawScene(const CremaShader *shGround, const CremaShader *shObjects,
-                      GX2RBuffer *groundVbo, GX2RBuffer *groundIbo,
-                      GX2RBuffer *torusVbo, GX2RBuffer *torusIbo,
-                      const GX2Texture *tex, const GX2Sampler *sampler,
-                      uint32_t texUnit,
-                      int32_t gLocG, int32_t gLocO, int32_t objLoc,
-                      int32_t gPsLocG, int32_t gPsLocO,
-                      const void *globalUbo, const void *objArray,
-                      size_t objBytes)
+static void drawScene(void *user)
 {
+    const SceneView *s = (const SceneView *)user;
+
     GX2SetDepthOnlyControl(TRUE, TRUE, GX2_COMPARE_FUNC_LESS);
     GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, TRUE);
 
-    CremaShaderBind(shGround);
-    GX2SetVertexUniformBlock(gLocG, sizeof(GlobalBlock), globalUbo);
-    GX2SetPixelUniformBlock(gPsLocG, sizeof(GlobalBlock), globalUbo);
-    GX2SetPixelTexture(tex, texUnit);
-    GX2SetPixelSampler(sampler, texUnit);
-    GX2RSetAttributeBuffer(groundVbo, 0, GROUND_STRIDE, 0);
-    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, groundIbo, GX2_INDEX_TYPE_U16,
-                    6, 0, 0, 1);
+    CremaShaderBind(s->shGround);
+    GX2SetVertexUniformBlock(s->gLocG, sizeof(GlobalBlock), s->globalUbo);
+    GX2SetPixelUniformBlock(s->gPsLocG, sizeof(GlobalBlock), s->globalUbo);
+    GX2SetPixelTexture(s->tex, s->texUnit);
+    GX2SetPixelSampler(s->sampler, s->texUnit);
+    GX2RSetAttributeBuffer(s->groundVbo, 0, GROUND_STRIDE, 0);
+    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->groundIbo,
+                    GX2_INDEX_TYPE_U16, 6, 0, 0, 1);
 
-    CremaShaderBind(shObjects);
-    GX2SetVertexUniformBlock(gLocO, sizeof(GlobalBlock), globalUbo);
-    GX2SetPixelUniformBlock(gPsLocO, sizeof(GlobalBlock), globalUbo);
-    GX2SetVertexUniformBlock(objLoc, objBytes, objArray);
-    GX2RSetAttributeBuffer(torusVbo, 0, TORUS_STRIDE, 0);
-    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, torusIbo, GX2_INDEX_TYPE_U16,
-                    TORUS_INDICES, 0, 0, NUM_OBJECTS);
+    CremaShaderBind(s->shObjects);
+    GX2SetVertexUniformBlock(s->gLocO, sizeof(GlobalBlock), s->globalUbo);
+    GX2SetPixelUniformBlock(s->gPsLocO, sizeof(GlobalBlock), s->globalUbo);
+    GX2SetVertexUniformBlock(s->objLoc, s->objBytes, s->objArray);
+    GX2RSetAttributeBuffer(s->torusVbo, 0, TORUS_STRIDE, 0);
+    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->torusIbo,
+                    GX2_INDEX_TYPE_U16, TORUS_INDICES, 0, 0, NUM_OBJECTS);
 }
 
 int main(int argc, char **argv)
@@ -346,58 +288,31 @@ int main(int argc, char **argv)
     float *tv = (float *)malloc(TORUS_VERTS * TORUS_STRIDE);
     uint16_t *ti = (uint16_t *)malloc(TORUS_INDICES * sizeof(uint16_t));
     buildTorus(tv, ti, 1.2f, 0.5f);
-    GX2RBuffer torusVbo = makeBuffer(GX2R_RESOURCE_BIND_VERTEX_BUFFER,
-                                     TORUS_STRIDE, TORUS_VERTS, tv);
-    GX2RBuffer torusIbo = makeBuffer(GX2R_RESOURCE_BIND_INDEX_BUFFER,
-                                     sizeof(uint16_t), TORUS_INDICES, ti);
+    GX2RBuffer torusVbo, torusIbo, groundVbo, groundIbo;
+    CremaBufferCreateVertex(&torusVbo, TORUS_STRIDE, TORUS_VERTS, tv);
+    CremaBufferCreateIndexU16(&torusIbo, TORUS_INDICES, ti);
     free(tv);
     free(ti);
-    GX2RBuffer groundVbo = makeBuffer(GX2R_RESOURCE_BIND_VERTEX_BUFFER,
-                                      GROUND_STRIDE, 4, GROUND_VERTS);
-    GX2RBuffer groundIbo = makeBuffer(GX2R_RESOURCE_BIND_INDEX_BUFFER,
-                                      sizeof(uint16_t), 6, GROUND_TRIS);
+    CremaBufferCreateVertex(&groundVbo, GROUND_STRIDE, 4, GROUND_VERTS);
+    CremaBufferCreateIndexU16(&groundIbo, 6, GROUND_TRIS);
 
-    // --- ground texture: full 9-level mip chain (256 -> 1), tiled ---
+    // --- ground texture: tiled, full 9-level mip chain (256 -> 1) ---
     // Without mips, looking down from altitude minifies the whole screen and
     // the per-pixel bilinear taps thrash the texture cache (measured: 60 -> 30
-    // fps on real HW). Box-filter the chain on CPU, upload each level via a
-    // linear staging texture + GX2CopySurface, sample trilinear.
-    #define MIP_LEVELS 9
+    // fps on real HW). Crema box-filters the chain and uploads every level.
+    #define GROUND_TEX_SIZE 256
     GX2Texture texTiled;
-    createTexture(&texTiled, GX2_TILE_MODE_DEFAULT, 256, MIP_LEVELS);
+    CremaTextureCreate(&texTiled, GROUND_TEX_SIZE, GROUND_TEX_SIZE,
+                       CremaTextureMipLevels(GROUND_TEX_SIZE, GROUND_TEX_SIZE),
+                       GX2_TILE_MODE_DEFAULT);
 
-    uint8_t *mipData[MIP_LEVELS];
-    mipData[0] = (uint8_t *)malloc(256 * 256 * 4);
-    fillGroundTexture(mipData[0], 256);   // tightly packed at level 0
-    for (int l = 1; l < MIP_LEVELS; l++) {
-        uint32_t srcSize = 256u >> (l - 1);
-        mipData[l] = (uint8_t *)malloc((srcSize / 2) * (srcSize / 2) * 4);
-        mipReduce(mipData[l - 1], mipData[l], srcSize);
-    }
-    for (int l = 0; l < MIP_LEVELS; l++) {
-        uint32_t size = 256u >> l;
-        GX2Texture staging;
-        createTexture(&staging, GX2_TILE_MODE_LINEAR_ALIGNED, size, 1);
-        uint8_t *dst = (uint8_t *)staging.surface.image;
-        for (uint32_t y = 0; y < size; y++)
-            memcpy(dst + (size_t)y * staging.surface.pitch * 4,
-                   mipData[l] + (size_t)y * size * 4, (size_t)size * 4);
-        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
-                      staging.surface.image, staging.surface.imageSize);
-        GX2CopySurface(&staging.surface, 0, 0, &texTiled.surface, l, 0);
-        GX2Flush();
-        GX2DrawDone();   // staging is freed right after: let the copy land
-        free(staging.surface.image);
-        free(mipData[l]);
-    }
-    WHBLogPrintf("[scene] ground texture ready: %d mip levels", MIP_LEVELS);
+    uint8_t *pixels = (uint8_t *)malloc(GROUND_TEX_SIZE * GROUND_TEX_SIZE * 4);
+    fillGroundTexture(pixels, GROUND_TEX_SIZE);
+    CremaTextureUploadWithMips(&texTiled, pixels);
+    free(pixels);
 
     GX2Sampler sampler;
-    GX2InitSampler(&sampler, GX2_TEX_CLAMP_MODE_WRAP,
-                   GX2_TEX_XY_FILTER_MODE_LINEAR);
-    GX2InitSamplerZMFilter(&sampler, GX2_TEX_Z_FILTER_MODE_NONE,
-                           GX2_TEX_MIP_FILTER_MODE_LINEAR);   // trilinear
-    GX2InitSamplerLOD(&sampler, 0.0f, 13.0f, 0.0f);
+    CremaSamplerInitTrilinear(&sampler, GX2_TEX_CLAMP_MODE_WRAP);
 
     // --- static object field: ring-of-rings layout with jitter ---
     float objData[NUM_OBJECTS][8];
@@ -417,7 +332,9 @@ int main(int argc, char **argv)
     uint8_t *objArray = (uint8_t *)CremaUniformAlloc(sizeof(objData));
     CremaUniformStore(objArray, objData, sizeof(objData));
 
-    uint8_t *globalSlices = (uint8_t *)CremaUniformAlloc(2 * GLOBAL_SLICE);
+    // per-frame globals: one byteswapped slice per frame in flight
+    CremaUniformRing globals;
+    CremaUniformRingCreate(&globals, sizeof(GlobalBlock), CREMA_FRAMES_IN_FLIGHT);
 
     // --- camera state ---
     Vec3 camPos = { 0.0f, 6.0f, 60.0f };
@@ -427,11 +344,32 @@ int main(int argc, char **argv)
     Vec3 lightRaw = { -0.45f, -0.7f, -0.55f };
     Vec3 lightDir = vec3_normalize(lightRaw);
 
-    GX2SetSwapInterval(1);   // this is a "game" now: rock-solid 59.94 Hz
+    // this is a "game" now: fenced pipelining, presented at vsync — 59.94 Hz
+    // with the CPU never blocking on the GPU.
+    CremaFrame frame;
+    CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
     WHBLogPrintf("[scene] controls: L-stick move, R-stick look, ZR up, ZL down, B boost");
 
-    uint32_t frameIdx = 0;
-    OSTime fence[2] = { 0, 0 };
+    SceneView view3d;
+    view3d.shGround  = shGround;
+    view3d.shObjects = shObjects;
+    view3d.groundVbo = &groundVbo;
+    view3d.groundIbo = &groundIbo;
+    view3d.torusVbo  = &torusVbo;
+    view3d.torusIbo  = &torusIbo;
+    view3d.tex       = &texTiled;
+    view3d.sampler   = &sampler;
+    view3d.texUnit   = texUnit;
+    view3d.gLocG     = gLocG;
+    view3d.gLocO     = gLocO;
+    view3d.objLoc    = objLoc;
+    view3d.gPsLocG   = gPsLocG;
+    view3d.gPsLocO   = gPsLocO;
+    view3d.objArray  = objArray;
+    view3d.objBytes  = sizeof(objData);
+
+    static const float SKY[4] = { 0.55f, 0.70f, 0.85f, 1.0f };   // == fog colour
+
     uint64_t prevTicks = OSGetSystemTime();
     uint64_t t0 = prevTicks;
     CremaFrameStats stats;
@@ -475,14 +413,8 @@ int main(int argc, char **argv)
             if (camPos.y < 1.0f) camPos.y = 1.0f;
         }
 
-        // --- frame N-2 fence: its UBO slice is about to be reused ---
-        uint32_t slot = frameIdx & 1;
-        uint64_t syncWait = 0;
-        if (fence[slot] != 0) {
-            uint64_t w0 = OSGetSystemTime();
-            GX2WaitTimeStamp(fence[slot]);
-            syncWait += OSGetSystemTime() - w0;
-        }
+        // waits for frame N-2 (whose uniform slice we are about to reuse)
+        uint32_t slot = CremaFrameBegin(&frame);
 
         Mat4 view = mat4_mul(mat4_rotate_x(-pitch),
                     mat4_mul(mat4_rotate_y(-yaw),
@@ -498,44 +430,20 @@ int main(int argc, char **argv)
         blk.fogColor[0] = 0.55f; blk.fogColor[1] = 0.70f;
         blk.fogColor[2] = 0.85f; blk.fogColor[3] = 1.0f;
         blk.time[0] = t; blk.time[1] = blk.time[2] = blk.time[3] = 0.0f;
-        uint8_t *globalUbo = globalSlices + slot * GLOBAL_SLICE;
-        CremaUniformStore(globalUbo, &blk, sizeof(blk));
+        view3d.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
 
-        WHBGfxBeginRender();
-
-        WHBGfxBeginRenderTV();
-        WHBGfxClearColor(0.55f, 0.70f, 0.85f, 1.0f);   // sky == fog colour
-        drawScene(shGround, shObjects, &groundVbo, &groundIbo,
-                  &torusVbo, &torusIbo, &texTiled, &sampler, texUnit,
-                  gLocG, gLocO, objLoc, gPsLocG, gPsLocO,
-                  globalUbo, objArray, sizeof(objData));
-        WHBGfxFinishRenderTV();
-
-        WHBGfxBeginRenderDRC();
-        WHBGfxClearColor(0.55f, 0.70f, 0.85f, 1.0f);
-        drawScene(shGround, shObjects, &groundVbo, &groundIbo,
-                  &torusVbo, &torusIbo, &texTiled, &sampler, texUnit,
-                  gLocG, gLocO, objLoc, gPsLocG, gPsLocO,
-                  globalUbo, objArray, sizeof(objData));
-        WHBGfxFinishRenderDRC();
-
-        GX2SwapScanBuffers();
-        GX2Flush();
-        fence[slot] = GX2GetLastSubmittedTimeStamp();
-
-        CremaFrameMarkManual(syncWait, &stats);
-        frameIdx++;
+        CremaFrameDrawBoth(SKY, drawScene, &view3d);
+        CremaFrameEnd(&frame, &stats);
     }
 
-    GX2DrawDone();
-    CremaUniformFreeBlock(globalSlices);
+    CremaFrameSettle(&frame);
+    CremaUniformRingDestroy(&globals);
     CremaUniformFreeBlock(objArray);
-    GX2RDestroyBufferEx(&groundIbo, (GX2RResourceFlags)0);
-    GX2RDestroyBufferEx(&groundVbo, (GX2RResourceFlags)0);
-    GX2RDestroyBufferEx(&torusIbo, (GX2RResourceFlags)0);
-    GX2RDestroyBufferEx(&torusVbo, (GX2RResourceFlags)0);
-    free(texTiled.surface.image);
-    free(texTiled.surface.mipmaps);
+    CremaBufferDestroy(&groundIbo);
+    CremaBufferDestroy(&groundVbo);
+    CremaBufferDestroy(&torusIbo);
+    CremaBufferDestroy(&torusVbo);
+    CremaTextureDestroy(&texTiled);
     CremaShaderFree(shGround);
     CremaShaderFree(shObjects);
     CremaShaderShutdownCompiler();

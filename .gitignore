@@ -4,3 +4,4 @@ external/glslcompiler.rpl
 *.rpx
 *.elf
 *.log
+__pycache__/

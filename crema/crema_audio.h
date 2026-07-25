@@ -108,6 +108,41 @@ void CremaAudioVoiceSilence(CremaAudioVoice *voice);
 void CremaAudioVoiceRamp(CremaAudioVoice *voice, float from, float to,
                          uint32_t samples, float pitch);
 
+// --- aux sends ---------------------------------------------------------------
+
+// AX gives every voice three sends besides the main mix. What is on the other
+// end of one is whatever you register with AXRegisterAuxCallback: your own code,
+// in the signal path, three milliseconds of it at a time. That is the only
+// programmable point in this pipeline — there is no effect library in wut, so
+// an echo or a reverb is something you write, not something you switch on.
+//
+// The send is global rather than per voice, because that is what it models. An
+// aux bus with a room on it is a room, and a room does not reverberate one
+// sound and not another. 0 is dry.
+#define CREMA_AUDIO_AUX_BUSES 3
+
+void  CremaAudioSetAuxSend(uint32_t bus, float level);
+float CremaAudioGetAuxSend(uint32_t bus);
+
+// --- headroom ----------------------------------------------------------------
+
+// How loud the whole mix is allowed to be, 0..1, applied to every voice's main
+// bus and to its sends alike.
+//
+// It exists because nothing else in this pipeline keeps count. Each voice is
+// mixed at the volume it was given and the buses simply add, so four music
+// channels, an engine and a laser arriving in the same millisecond are a sum of
+// six perfectly reasonable numbers — and the sum clips, which is heard exactly
+// when the music gets busy and the player starts shooting, i.e. at the worst
+// possible moment. Headroom is the answer to "how many loud things at once",
+// and applying it uniformly means turning it down costs volume, never balance.
+//
+// What it should be set to is not a matter of taste but of measurement: send
+// every voice to an aux bus at 1.0 and the effect on that bus sees precisely
+// the sum the main bus sees.
+void  CremaAudioSetHeadroom(float headroom);
+float CremaAudioGetHeadroom(void);
+
 // Once per frame: hands back the voices whose one-shots have finished. Without
 // it the pool fills up after a few dozen shots and the game goes quiet.
 void CremaAudioUpdate(void);

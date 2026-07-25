@@ -36,6 +36,75 @@ static struct CremaAudioVoice s_voices[CREMA_AUDIO_VOICES];
 static bool     s_ready;
 static uint32_t s_mixRate = 48000;
 
+// How much of every voice is sent to each aux bus. Global rather than per
+// voice, because that is what it models: an aux bus with an effect on it is a
+// room, and a room does not reverberate one sound and not another.
+static float    s_auxSend[CREMA_AUDIO_AUX_BUSES];
+
+// The one place the total loudness of the mix is decided.
+//
+// Nothing else in this pipeline keeps count. A voice is mixed at the volume it
+// was given and the buses simply add, so four music channels, an engine and a
+// laser arriving together are a sum of six things that were each perfectly
+// reasonable on their own — and the sum clips, audibly, exactly at the moment
+// the music gets busy and the player starts shooting. Headroom is the answer to
+// "how many loud things at once", applied uniformly so that turning it down
+// costs volume and never balance.
+static float    s_headroom = 1.0f;
+
+// Where a mono voice lands on a device's channels. Bus 0 is the main mix and
+// buses 1..3 are the three aux sends — which is not obvious and is not written
+// down anywhere in wut: AX's own mixer indexes its scratch buffer as
+// `(1 + auxBus)`, so the effect registered on aux bus 0 reads what was written
+// to bus[1]. Channels 0 and 1 are left and right.
+static void applyDeviceMix(AXVoice *v)
+{
+    uint16_t main = (uint16_t)(s_headroom * (float)AX_UNITY_VOLUME);
+
+    AXVoiceDeviceMixData mix[6];
+    memset(mix, 0, sizeof(mix));
+    for (int ch = 0; ch < 2; ch++) {
+        mix[ch].bus[0].volume = main;
+        for (int b = 0; b < CREMA_AUDIO_AUX_BUSES; b++) {
+            // The headroom scales the sends too, and that is the point of doing
+            // it here rather than on a master fader downstream: an effect stays
+            // in the same proportion to the dry signal however loud the mix is,
+            // and a send of 1.0 measures exactly what the main bus receives.
+            float lvl = s_auxSend[b] * s_headroom;
+            if (lvl > 0.0f)
+                mix[ch].bus[b + 1].volume =
+                    (uint16_t)(lvl * (float)AX_UNITY_VOLUME);
+        }
+    }
+    AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_TV, 0, mix);
+
+    // The GamePad gets the dry signal only. Not a taste decision: Cemu does not
+    // implement the DRC aux path at all — its mixer stores the TV aux buses and
+    // leaves the DRC ones as a `// todo` — so a voice sent to a DRC aux bus is
+    // simply lost there. The one time the emulator is the stricter machine.
+    AXVoiceDeviceMixData drc[6];
+    memset(drc, 0, sizeof(drc));
+    drc[0].bus[0].volume = main;
+    drc[1].bus[0].volume = main;
+    AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_DRC, 0, drc);
+}
+
+// Re-aims every voice that is currently playing, so a change is heard on the
+// note that is sounding rather than on the next one.
+static void refreshAllMixes(void)
+{
+    if (!s_ready)
+        return;
+    for (int i = 0; i < CREMA_AUDIO_VOICES; i++) {
+        AXVoice *v = s_voices[i].ax;
+        if (!s_voices[i].inUse || !v)
+            continue;
+        AXVoiceBegin(v);
+        applyDeviceMix(v);
+        AXVoiceEnd(v);
+    }
+}
+
 // AX can take a voice away from us to give it to something more important. It
 // tells us by calling this, on its own thread, *after* the voice is gone — so
 // the one correct reaction is to forget the pointer and never free it.
@@ -217,15 +286,7 @@ static struct CremaAudioVoice *acquireSlot(bool held)
     ve.delta  = 0;
     AXSetVoiceVe(v, &ve);
 
-    // The device mix is where a mono voice lands on a device's channels: bus 0
-    // is the main mix, channels 0 and 1 are left and right. Both devices, so
-    // the sound comes out of the TV and the GamePad alike.
-    AXVoiceDeviceMixData mix[6];
-    memset(mix, 0, sizeof(mix));
-    mix[0].bus[0].volume = AX_UNITY_VOLUME;
-    mix[1].bus[0].volume = AX_UNITY_VOLUME;
-    AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_TV,  0, mix);
-    AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_DRC, 0, mix);
+    applyDeviceMix(v);
 
     AXSetVoiceSrcType(v, AX_VOICE_SRC_TYPE_LINEAR);
     AXVoiceEnd(v);
@@ -391,6 +452,34 @@ void CremaAudioUpdate(void)
             slot->inUse = false;
         }
     }
+}
+
+void CremaAudioSetAuxSend(uint32_t bus, float level)
+{
+    if (bus >= CREMA_AUDIO_AUX_BUSES)
+        return;
+    if (level < 0.0f) level = 0.0f;
+    if (level > 1.0f) level = 1.0f;
+    s_auxSend[bus] = level;
+    refreshAllMixes();
+}
+
+void CremaAudioSetHeadroom(float headroom)
+{
+    if (headroom < 0.05f) headroom = 0.05f;
+    if (headroom > 1.0f)  headroom = 1.0f;
+    s_headroom = headroom;
+    refreshAllMixes();
+}
+
+float CremaAudioGetHeadroom(void)
+{
+    return s_headroom;
+}
+
+float CremaAudioGetAuxSend(uint32_t bus)
+{
+    return bus < CREMA_AUDIO_AUX_BUSES ? s_auxSend[bus] : 0.0f;
 }
 
 uint32_t CremaAudioVoicesInUse(void)

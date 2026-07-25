@@ -347,6 +347,79 @@ the same binary, which is the JIT and the host scheduler, not the code.
 Hardware said 14 µs for the sequencer before envelopes existed and will be the
 one to say what they cost. **Not yet measured on hardware.**
 
+### Our own code inside AX's signal path
+
+There is one programmable point in this console's audio pipeline, and wut does
+not describe it. `AXRegisterAuxCallback` puts a function of yours in the signal
+path — three milliseconds of somebody's mix, once per audio frame, to do as you
+like with — and since wut exposes `sndcore2` and nothing else, there is no
+effect library to switch on. A reverb here is something you write.
+
+The header declares:
+
+```c
+typedef void (*AXAuxCallback)(void *, void *);
+```
+
+which is **one argument short**. AX passes three: the channel data, the user
+pointer, and a struct saying how many channels and how many samples — and
+without that third one you cannot write the loop. The rest was undocumented in
+the same way and was read out of Cemu's implementation, which is where a working
+emulator had to know the answers:
+
+| | |
+|---|---|
+| registration | `(device, deviceIndex, auxBus, callback, userData)` — wut's two `unk`s |
+| buffer | **planar int32**, an array of `numChannels` pointers, each `numSamples` long |
+| shape | 6 channels for the TV, 4 for the GamePad, 144 samples at 48 kHz |
+| direction | **in place** — the buffer handed in is the one AX reads back |
+| routing | `mix[channel].bus[1]` is the send to aux bus **0**; AX indexes its scratch as `(1 + auxBus)` |
+| timing | it processes the **previous** frame, before that frame's app callback — 3 ms of latency |
+
+All of it confirmed at runtime: **338 calls a second, 6 channels × 144 samples**,
+the third argument arriving exactly where it was predicted to.
+
+The one thing an emulator could not answer was the numeric scale. Cemu stores
+aux samples shifted right by eight with a comment saying it is not sure why, so
+the effect measures its own peak instead of assuming: **13090 on a mix of five
+voices at a 0.45 send**, which settles it — the buffer is at int16 scale, ±32767,
+not the ±128 that reading the shift alone would suggest.
+
+An echo — 170 ms, feedback, in plain C in a file that includes no console header
+— costs **6-8 µs per call against a 3000 µs frame**, about 0.2% of the audio
+thread. That is the number that says a reverb is affordable. Two caveats worth
+having in writing: **Cemu does not implement the GamePad's aux path at all**
+(its mixer stores the TV aux buses and leaves the DRC ones a `// todo`), the one
+place where the emulator is stricter than the console; and there is no cache
+maintenance around these buffers here, on the theory that AX presents them
+coherently — untested, and the kind of thing only hardware can settle.
+
+### The mix had no headroom, and a second aux bus proved it
+
+Then a report: firing while the lead comes in makes it clip. Every voice was
+mixed at unity and nothing kept count — four music channels, an engine and a
+laser are a sum of six numbers that were each perfectly reasonable alone.
+
+Rather than guess how much to turn down, measure. **An aux bus receives exactly
+the voices the main bus does, summed the same way**, so a second callback with
+every send at 1.0 is a true peak meter of the mix: it compares, then writes
+silence over its own buffer so it costs nothing on the way out. What it read,
+with nobody even shooting:
+
+```
+[mix] peak 62859 (192% of full scale)
+```
+
+Not "close to clipping" — nearly twice over, continuously. `CremaAudioSetHeadroom`
+scales every voice's main bus *and its sends together*, so turning it down costs
+volume and never balance, and an effect stays in the same proportion to the dry
+signal. At 0.35 the same scene reads **55-69%**, with the echo's return
+accounting for another 28% on top of that.
+
+The general lesson is not about this game. **A mixer that only adds has no idea
+how loud it is**, and neither does anyone reading the code; the number was
+available all along from hardware that was already summing it for us.
+
 ### What loading actually costs (measured on console)
 
 Loading a 14.5 KB mesh and a 341 KB mipped texture from the SD card under

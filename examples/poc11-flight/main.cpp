@@ -47,6 +47,11 @@
 #include "crema_pak.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
+// auxbus.h and not aux.h: Windows still reserves AUX as a device name, so a
+// file called that cannot be opened by anything using the plain Win32 API —
+// git included, which notices long after a Docker-hosted compiler did not.
+#include "auxbus.h"     // our own code inside AX's signal path
+#include "echo.h"       // and the effect it runs, which knows no console at all
 #include "hud.h"        // the readout: quads in screen space, no console either
 
 #define NUM_WINGMEN 4
@@ -689,6 +694,20 @@ int main(int argc, char **argv)
     // First thing after the app is up, before a single asset is read: this is
     // what takes the audio hardware away from the Wii U Menu's music.
     CremaAudioInit();
+    // Measured, not chosen. With every voice mixed at unity the meter on aux
+    // bus 1 read 187-192% of full scale just idling — four music channels, an
+    // engine and the odd explosion, all perfectly reasonable on their own,
+    // adding up to nearly twice what a sample can hold. That is the clipping
+    // you hear when the lead comes in and you fire at the same moment.
+    //
+    // 0.40 brought the dry mix down to 40-66%, but the meter only sees the
+    // voices: the echo's return is added afterwards, and at 0.40 its peak was
+    // another 10738 on top of a dry 21561 — 98% of full scale if the two ever
+    // line up. 0.35 keeps the sum under 90% with the effect running, which is
+    // what a headroom is for.
+    CremaAudioSetHeadroom(0.35f);
+    if (auxInit())
+        auxSetEnabled(true);    // on from the start; Y is the A/B against dry
     if (!CremaShaderInitCompiler()) {
         CremaAppShutdown();
         return -1;
@@ -932,7 +951,7 @@ int main(int argc, char **argv)
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
     WHBLogPrintf("[flight] L-stick fly (forward dives), ZR/ZL throttle, A fire,"
-                 " MINUS swaps song, PLUS toggles envelopes."
+                 " MINUS swaps song, PLUS toggles envelopes, Y toggles echo."
                  " %d wingmen, %d hostiles.", NUM_WINGMEN, ENEMY_COUNT);
 
     CremaFrameStats stats;
@@ -970,6 +989,16 @@ int main(int argc, char **argv)
             CremaMusicSetShaping(music, on);
             CremaMusicSetShaping(chiproll, on);
             WHBLogPrintf("[flight] envelopes %s", on ? "on" : "off (rectangles)");
+        }
+
+        // Y opens the aux send into our own echo. The counter in the log is the
+        // first thing to read even when nothing is audible: a callback that is
+        // being called with the channel and sample counts we expected means the
+        // registration and the ABI are right, and anything still wrong after
+        // that is the effect or the routing rather than the plumbing.
+        if (CremaInputPressed(&input, VPAD_BUTTON_Y)) {
+            auxSetEnabled(!s_echoOn);
+            WHBLogPrintf("[flight] echo %s", s_echoOn ? "on" : "off");
         }
 
         // The engine note rides the throttle: one 0.2 s loop, resampled. This
@@ -1232,10 +1261,32 @@ int main(int argc, char **argv)
                          (unsigned)CremaAudioVoicesInUse(),
                          ms.lastUs, ms.maxUs, ms.ticks, ms.notesOn, ms.loops,
                          CremaMusicShaping(playing) ? "on" : "off");
+            // What the aux callback saw. Channels and samples say the ABI was
+            // read correctly; the peaks say what scale AX actually uses in an
+            // aux buffer, which is the one number no header or emulator can be
+            // trusted for.
+            WHBLogPrintf("[aux] echo %s | %u calls | %u ch x %u samples | "
+                         "peak in %d, out %d | send %.2f | %u us last, "
+                         "%u us worst",
+                         s_echoOn ? "on" : "off", s_echo.calls,
+                         s_echo.lastChannels, s_echo.lastSamples,
+                         (int)s_echo.peakIn, (int)s_echo.peakOut,
+                         CremaAudioGetAuxSend(AUX_BUS),
+                         s_auxUs, s_auxWorstUs);
+            // The mix as the speakers get it, against the 32767 it has to fit
+            // in. Over 100% is not a warning that it might clip: it is the
+            // amount by which it already did.
+            int32_t peak = meterRead();
+            WHBLogPrintf("[mix] peak %d (%.0f%% of full scale), worst %d "
+                         "(%.0f%%) | headroom %.2f",
+                         (int)peak, peak * 100.0 / 32767.0,
+                         (int)s_meterHigh, s_meterHigh * 100.0 / 32767.0,
+                         CremaAudioGetHeadroom());
         }
     }
 
     CremaFrameSettle(&frame);
+    auxShutdown();      // before the voices: nothing may still be sending
     CremaAudioRelease(engineVoice);
     CremaMusicClose(chiproll);
     CremaMusicClose(music);

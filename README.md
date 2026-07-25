@@ -241,10 +241,22 @@ Which also means you will not *hear* it on staccato single notes, since a few
 cents is under most listeners' threshold; it shows up when two channels hold
 the same note or the octave and start to beat.
 
-One rule of chiproll's format worth writing down, because it is a deliberate
-choice and not an accident: **an empty step is a rest, not a held note.** That
-is the DAW piano-roll convention, and the opposite of FamiTracker, where a
-blank cell sustains and rests have to be written.
+Two rules of chiproll's format are worth writing down, because they are
+deliberate choices rather than accidents, and because together they are what
+makes the grid unambiguous:
+
+- **an empty step is a rest, not a held note.** The DAW piano-roll convention,
+  and the opposite of FamiTracker, where a blank cell sustains and rests have
+  to be written.
+- **a held note is the same note on contiguous steps.** Two cells of C#4 are
+  one note two cells long, not two attacks — the grid is run-length encoded,
+  the way a piano roll's rectangle looks when you drag its edge. The importer
+  coalesces runs rather than counting them.
+
+They cooperate exactly because the second needs *contiguous* cells: two notes
+of the same pitch with a rest between them stay two attacks. The price of the
+grammar is that a note cannot be retriggered at the same pitch on the very next
+step — to strike it twice you leave a cell.
 
 ### The sequencer runs on AX's clock, not on yours
 

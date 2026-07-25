@@ -17,19 +17,26 @@ stop.
 
     python tools/chiproll_import.py session.json out.csong
 
-Two rules that are not in the file but are in the format, confirmed by its
-author:
+Two rules that are not written in the file but are part of the format,
+confirmed by its author:
 
   - **an empty step is a rest, not a held note.** This is chiproll's convention
     on purpose, taken from DAW piano rolls and against the tracker habit:
     FamiTracker makes you write the rest, and leaving the cell blank sustains
-    what came before. Here blank means silence. (Held notes exist in chiproll
-    and are expressed some other way; when a session using them turns up, this
-    is where the handling goes.)
-  - a step is a sixteenth note by default (--steps-per-beat). chiproll gives a
-    BPM and a step count and leaves the subdivision to the reader.
+    what came before. Here blank means silence.
+  - **a held note is the same note repeated over contiguous steps.** Two cells
+    of C#4 are one note two cells long, not two attacks — the grid is
+    run-length encoded, the way a piano roll's rectangle looks when you drag
+    its edge. So this importer coalesces runs rather than counting them, and
+    the price of that grammar is that a note cannot be immediately retriggered
+    at the same pitch: to strike it twice you leave a cell between.
 
---gate sets how much of its step a note holds before the note-off.
+The two conventions cooperate exactly because the second needs *contiguous*
+cells: notes of the same pitch separated by a rest stay separate attacks.
+
+A step is a sixteenth note by default (--steps-per-beat), which is the one
+thing chiproll leaves to the reader. --gate sets how much of a note's last
+step is held before the note-off.
 """
 
 import json
@@ -87,6 +94,28 @@ def midi_from_name(name):
         return None
 
 
+def runs(steps):
+    """Walk a channel's grid and yield (first step, how many cells it holds).
+
+    The same note on contiguous cells is one held note. Identity is the note
+    *and* its register, because the register is what the chip is actually given
+    and two cells that disagree about it are two different sounds however they
+    are spelled."""
+    out = []
+    for st in steps:
+        if st.get("note") is None:
+            continue
+        key = (st["note"], st.get("register"))
+        if out:
+            prev, length = out[-1]
+            if (st["step"] == prev["step"] + length and
+                    (prev["note"], prev.get("register")) == key):
+                out[-1] = (prev, length + 1)
+                continue
+        out.append((st, 1))
+    return out
+
+
 def noise_note(register):
     """A noise register as a note our sampler can transpose to."""
     if register is None or not (0 <= register < len(NES_NOISE_PERIODS)):
@@ -131,9 +160,10 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
 
         notes = 0
         detuned = 0
-        for step in chan["steps"]:
-            if step.get("note") is None:
-                continue
+        held = 0
+        for step, length in runs(chan["steps"]):
+            if length > 1:
+                held += 1
             if chan.get("kind") == "noise":
                 note, cents = noise_note(step.get("register"))
             else:
@@ -147,13 +177,16 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
                     detuned += 1
             cents = max(-127, min(127, int(round(cents))))
             t0 = int(round(step["step"] * step_ms))
-            t1 = int(round((step["step"] + gate) * step_ms))
+            # the gate eats into the LAST step of the run, so a note two cells
+            # long is two cells long and not two notes of one
+            t1 = int(round((step["step"] + length - (1.0 - gate)) * step_ms))
             events.append((t0, out_channel, NOTE_ON, note, inst_index,
                            volume, cents))
             events.append((t1, out_channel, NOTE_OFF, note, inst_index, 0, 0))
             notes += 1
-        report.append("  %-9s -> %-9s %3d notes%s"
+        report.append("  %-9s -> %-9s %3d notes%s%s"
                       % (chan["id"], inst_name, notes,
+                         ", %d held" % held if held else "",
                          ", %d off the ideal pitch" % detuned if detuned else ""))
 
     events.sort(key=lambda e: (e[0], e[2]))

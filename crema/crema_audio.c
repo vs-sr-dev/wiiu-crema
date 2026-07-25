@@ -314,6 +314,33 @@ void CremaAudioVoiceSilence(CremaAudioVoice *voice)
         AXSetVoiceState(voice->ax, AX_VOICE_STATE_STOPPED);
 }
 
+void CremaAudioVoiceRamp(CremaAudioVoice *voice, float from, float to,
+                         uint32_t samples, float pitch)
+{
+    if (!voice || !voice->inUse || samples == 0)
+        return;
+    AXVoice *v = voice->ax;
+    if (!v)
+        return;
+
+    int32_t a = (int32_t)volumeToFixed(from);
+    int32_t b = (int32_t)volumeToFixed(to);
+
+    AXVoiceBegin(v);
+    AXVoiceVeData ve;
+    ve.volume = (uint16_t)a;
+    // Truncating division leaves the ramp a hair short of its target, and that
+    // is fine: the next frame writes the exact volume again, so the error never
+    // accumulates. What must not happen is the opposite — a delta left behind
+    // in a voice nobody writes to again keeps being applied every frame, which
+    // is why the caller writes once more with from == to when the ramp ends.
+    // (AXSetVoiceVeDelta sets that field alone; we always have both numbers.)
+    ve.delta = (int16_t)((b - a) / (int32_t)samples);
+    AXSetVoiceVe(v, &ve);
+    AXSetVoiceSrcRatio(v, pitchToRatio(voice->rate, pitch));
+    AXVoiceEnd(v);
+}
+
 void CremaAudioVoiceSet(CremaAudioVoice *voice, float volume, float pitch)
 {
     if (!voice || !voice->inUse)

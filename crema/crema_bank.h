@@ -36,10 +36,38 @@
 extern "C" {
 #endif
 
+// What a note does over its own lifetime — and this, not reverb, is what
+// separates an instrument from a beep. Without it every note is a rectangle:
+// full volume the instant it starts, full volume until it stops, silence. No
+// real sound has ever done that, which is why a tune made of rectangles sounds
+// like a test tone playing a melody.
+//
+// Times are milliseconds, sustain is a fraction in thousandths of the note's
+// own volume. All zeros mean the rectangle, deliberately: an instrument that
+// says nothing about its shape gets the behaviour it had before this existed.
+typedef struct {
+    uint16_t attackMs;    // silence to full
+    uint16_t decayMs;     // full down to the sustain level
+    uint16_t sustain;     // 1000 = hold at full, 0 = a percussive hit
+    uint16_t releaseMs;   // note-off to silence — the part that stops the click
+} CremaEnvelope;
+
+// Vibrato, which is the other half of the same idea applied to pitch. It waits
+// before it starts because that is what a player does: you decide to hold a
+// note first, and only then start moving it. Applied on top of the note's own
+// detune, so a chip's out-of-tune-ness survives underneath it.
+typedef struct {
+    uint16_t delayMs;
+    uint16_t rateMilliHz; // 5500 = 5.5 Hz
+    int16_t  depthCents;  // peak deviation; 0 disables the whole thing
+} CremaVibrato;
+
 typedef struct {
     char       name[24];
     CremaSound sound;          // owns DSP-visible, cache-flushed PCM
     uint32_t   cycleSamples;   // 0 = not pitched
+    CremaEnvelope env;
+    CremaVibrato  vib;
 } CremaInstrument;
 
 typedef struct {

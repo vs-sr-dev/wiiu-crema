@@ -931,7 +931,8 @@ int main(int argc, char **argv)
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
-    WHBLogPrintf("[flight] L-stick fly (forward dives), ZR/ZL throttle, A fire."
+    WHBLogPrintf("[flight] L-stick fly (forward dives), ZR/ZL throttle, A fire,"
+                 " MINUS swaps song, PLUS toggles envelopes."
                  " %d wingmen, %d hostiles.", NUM_WINGMEN, ENEMY_COUNT);
 
     CremaFrameStats stats;
@@ -958,6 +959,17 @@ int main(int argc, char **argv)
             CremaMusicStart(playing);
             WHBLogPrintf("[flight] now playing the %s song",
                          playing == chiproll ? "chiproll" : "hand-written");
+        }
+
+        // PLUS is the audition switch: the same song with the instruments'
+        // envelopes and vibrato applied, and without. It is here rather than in
+        // a tool because the one question a PC cannot answer is what a decay
+        // sounds like through a television.
+        if (CremaInputPressed(&input, VPAD_BUTTON_PLUS)) {
+            bool on = !CremaMusicShaping(playing);
+            CremaMusicSetShaping(music, on);
+            CremaMusicSetShaping(chiproll, on);
+            WHBLogPrintf("[flight] envelopes %s", on ? "on" : "off (rectangles)");
         }
 
         // The engine note rides the throttle: one 0.2 s loop, resampled. This
@@ -1215,10 +1227,11 @@ int main(int argc, char **argv)
             CremaMusicGetStats(playing, &ms);
             WHBLogPrintf("[flight] %.1f fps | speed %.0f | alt %.0f | sync %.2f ms"
                          " | voices %u | seq %u us last, %u us worst, %u ticks,"
-                         " %u notes, %u loops",
+                         " %u notes, %u loops | env %s",
                          stats.fps, flight.speed, flight.pos.y, stats.drainMs,
                          (unsigned)CremaAudioVoicesInUse(),
-                         ms.lastUs, ms.maxUs, ms.ticks, ms.notesOn, ms.loops);
+                         ms.lastUs, ms.maxUs, ms.ticks, ms.notesOn, ms.loops,
+                         CremaMusicShaping(playing) ? "on" : "off");
         }
     }
 

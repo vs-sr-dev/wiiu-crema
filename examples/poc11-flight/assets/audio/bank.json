@@ -6,42 +6,93 @@
       "file": "pulse12.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 32
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 2,
+        "decay": 130,
+        "sustain": 0.55,
+        "release": 90
+      },
+      "vibrato": {
+        "delay": 240,
+        "rate": 5.4,
+        "depth": 22
+      }
     },
     {
       "name": "pulse25",
       "file": "pulse25.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 32
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 3,
+        "decay": 170,
+        "sustain": 0.62,
+        "release": 110
+      },
+      "vibrato": {
+        "delay": 240,
+        "rate": 5.4,
+        "depth": 22
+      }
     },
     {
       "name": "pulse50",
       "file": "pulse50.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 32
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 4,
+        "decay": 220,
+        "sustain": 0.72,
+        "release": 130
+      }
     },
     {
       "name": "triangle",
       "file": "triangle.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 32
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 2,
+        "decay": 320,
+        "sustain": 0.88,
+        "release": 70
+      }
     },
     {
       "name": "saw",
       "file": "saw.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 32
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 6,
+        "decay": 190,
+        "sustain": 0.6,
+        "release": 120
+      },
+      "vibrato": {
+        "delay": 300,
+        "rate": 4.8,
+        "depth": 18
+      }
     },
     {
       "name": "noise",
       "file": "noise.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 0
+      "cycleSamples": 0,
+      "envelope": {
+        "attack": 0,
+        "decay": 55,
+        "sustain": 0.0,
+        "release": 40
+      }
     },
     {
       "name": "laser",

@@ -21,6 +21,15 @@
 // A song is a flat list of events sorted in time, which is a piano roll and not
 // a pattern grid: this note starts on this channel at this millisecond, this
 // note stops. Baked by tools/gen_song.py.
+//
+// The tick does one more thing than start and stop notes, and it is the thing
+// that made this stop sounding like a test tone: it shapes them. Each note runs
+// its instrument's envelope — attack, decay, sustain, release — and its
+// vibrato, which cost a few multiplies on a tick that was being paid for
+// anyway. The volume is not written as a step: an AX voice carries a volume and
+// a per-sample delta, so the sequencer hands the DSP "from here to there, over
+// this frame" and the hardware fills in the 144 samples in between. A 333 Hz
+// staircase would have been a buzz; this is a fade.
 
 #pragma once
 #include <stdbool.h>
@@ -62,6 +71,17 @@ void CremaMusicStop(CremaMusic *music);
 // 0..1, applied on top of each note's own volume. Takes effect on the next
 // note — the point is to duck the music under an explosion, not to fade it.
 void CremaMusicSetVolume(CremaMusic *music, float volume);
+
+// Envelopes and vibrato on or off, live, mid-song.
+//
+// This is the audition switch, and it earns its place by being the only way to
+// answer the question it asks. Off, every note is the rectangle the sequencer
+// played before instrument shapes existed; on, the bank's own attack, decay,
+// sustain, release and vibrato are applied. Same song, same samples, same
+// television — the difference you hear is the entire feature, and hearing it
+// A against B is worth more than any amount of reasoning about it.
+void CremaMusicSetShaping(CremaMusic *music, bool on);
+bool CremaMusicShaping(const CremaMusic *music);
 
 bool CremaMusicPlaying(const CremaMusic *music);
 void CremaMusicGetStats(const CremaMusic *music, CremaMusicStats *out);

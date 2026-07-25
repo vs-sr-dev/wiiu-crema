@@ -159,19 +159,56 @@ def engine():
     return out
 
 
-# name -> (samples, loops, cycleSamples). cycleSamples 0 means "not pitched":
-# the caller drives the rate directly instead of asking for a note.
+# --- the shape of a note -----------------------------------------------------
+#
+# A single cycle in a loop is a waveform, not an instrument. What it is missing
+# is time: a note that comes up, settles, and falls away when you let go of it.
+# Without this every note is a rectangle — full volume the instant it starts,
+# full until it stops, silence — and a tune made of rectangles sounds like a
+# test tone playing a melody. It is not the reverb that was missing.
+#
+# Times are milliseconds; sustain is a fraction of the note's own volume, held
+# until the note-off; vibrato waits before it starts because that is what a
+# player does — you commit to holding a note first, and only then move it.
+
+def adsr(attack, decay, sustain, release):
+    return {"attack": attack, "decay": decay, "sustain": sustain,
+            "release": release}
+
+
+def vibrato(delay, rate, depth):
+    return {"delay": delay, "rate": rate, "depth": depth}
+
+
+# The leads carry the melody, so they keep most of their body after the decay
+# and get a slow, shallow vibrato that only reaches the notes held long enough
+# to need it. The bass pulse does not: a wobble under everything else is mud.
+# The triangle is the NES bass part and stays where it is put. And the noise
+# channel is percussion — sustain zero is what turns a burst of static into a
+# hit, and the sequencer ends the voice as soon as the decay has run out.
+LEAD_VIB = vibrato(delay=240, rate=5.4, depth=22)
+
+
 def build():
     return [
-        ("pulse12",  pulse(0.125), True,  CYCLE),
-        ("pulse25",  pulse(0.25),  True,  CYCLE),
-        ("pulse50",  pulse(0.50),  True,  CYCLE),
-        ("triangle", triangle(),   True,  CYCLE),
-        ("saw",      saw(),        True,  CYCLE),
-        ("noise",    noise(),      True,  0),
-        ("laser",    laser(),      False, 0),
-        ("boom",     boom(),       False, 0),
-        ("engine",   engine(),     True,  0),
+        ("pulse12",  pulse(0.125), True,  CYCLE,
+         adsr(2, 130, 0.55, 90),  LEAD_VIB),
+        ("pulse25",  pulse(0.25),  True,  CYCLE,
+         adsr(3, 170, 0.62, 110), LEAD_VIB),
+        ("pulse50",  pulse(0.50),  True,  CYCLE,
+         adsr(4, 220, 0.72, 130), None),
+        ("triangle", triangle(),   True,  CYCLE,
+         adsr(2, 320, 0.88, 70),  None),
+        ("saw",      saw(),        True,  CYCLE,
+         adsr(6, 190, 0.60, 120), vibrato(delay=300, rate=4.8, depth=18)),
+        ("noise",    noise(),      True,  0,
+         adsr(0, 55, 0.0, 40),    None),
+        # The effects shape themselves — a laser that already fades cannot be
+        # told to fade again — so they keep the rectangle, which for a one-shot
+        # means "play exactly what was baked".
+        ("laser",    laser(),      False, 0, None, None),
+        ("boom",     boom(),       False, 0, None, None),
+        ("engine",   engine(),     True,  0, None, None),
     ]
 
 
@@ -180,7 +217,7 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     manifest = {"rate": RATE, "instruments": []}
-    for name, samples, loops, cycle in build():
+    for name, samples, loops, cycle, env, vib in build():
         write_wav(os.path.join(outdir, name + ".wav"), samples)
         peak = max(abs(s) for s in samples)
         clipped = sum(1 for s in samples if abs(s) >= 32000)
@@ -198,16 +235,27 @@ def main():
                                         "ok" if wrap <= worst else "WILL CLICK")
         elif loops:
             seam = "  single cycle"
-        manifest["instruments"].append({
+        entry = {
             "name": name,
             "file": name + ".wav",
             "loop": bool(loops),
             "loopStart": 0,
             "cycleSamples": cycle,
-        })
-        print("  %-9s %6d samples  %.3f s  peak %5d%s%s"
+        }
+        if env:
+            entry["envelope"] = env
+        if vib:
+            entry["vibrato"] = vib
+        manifest["instruments"].append(entry)
+        shape = ""
+        if env:
+            shape = "  %d/%d/%.2f/%d ms" % (env["attack"], env["decay"],
+                                            env["sustain"], env["release"])
+        if vib:
+            shape += "  vib %.1f Hz %+d cents" % (vib["rate"], vib["depth"])
+        print("  %-9s %6d samples  %.3f s  peak %5d%s%s%s"
               % (name, len(samples), len(samples) / RATE, peak,
-                 "  CLIPPED %d" % clipped if clipped else "", seam))
+                 "  CLIPPED %d" % clipped if clipped else "", seam, shape))
 
     path = os.path.join(outdir, "bank.json")
     with open(path, "w") as fh:

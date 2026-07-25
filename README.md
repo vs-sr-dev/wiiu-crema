@@ -295,6 +295,58 @@ the same work. It recompiles PPC to x86, but it measures time through its own
 overhead, while on hardware `OSGetSystemTime` reads the real timebase and the
 code is native.
 
+### Every note was a rectangle, and that was the missing sound
+
+The tune played, and it sounded bare. The instinct is to reach for reverb; the
+actual hole was earlier than that. Every note was a rectangle — full volume the
+instant it started, full volume until the note-off, then nothing. No real sound
+has ever done that, and a melody made of rectangles is a test tone with a tune
+in it.
+
+So the `.cbank` grew sixteen bytes per instrument (attack, decay, sustain,
+release, and a vibrato that waits before it starts, because that is what a
+player does), and the sequencer's tick — which was already running 333 times a
+second doing nothing but starting and stopping notes — now shapes them too.
+Which raises the problem worth writing down:
+
+**333 Hz is not enough resolution for a volume.** A fade written once per audio
+frame is a staircase of 3 ms steps, and a staircase in a volume is a buzz. But
+an AX voice does not carry a volume: it carries a volume *and a per-sample
+delta*, and Cemu's own mixer says exactly what happens to them
+(`ax_mix.cpp`) —
+
+```cpp
+volumeScaler += volumeScalerDelta;      // once per sample
+sampleData[i] *= volumeScaler;
+...
+internalShadowCopy->veVolume = veVolume + volumeDelta * sampleCount;
+```
+
+So the sequencer says "from here to there, over this frame" and the hardware
+fills in the 144 samples between. The envelope thinks at 333 Hz and comes out at
+48 kHz.
+
+The second line of that quote is a trap, and it is why the code tracks whether a
+voice is mid-ramp: **the delta stays in the voice.** Write one and stop writing,
+and the DSP keeps applying it every frame afterwards, walking the volume off on
+its own. A note that reaches its sustain has to be told once, explicitly, that
+it has stopped moving — after which the channel writes nothing at all, which is
+why holding a chord costs the same as holding silence.
+
+Two more things fell out of it. An attack of 2 ms is *shorter than a tick*, so
+rounding it to the nearest tick rounds it to zero and puts the click back; it
+gets one full frame of ramp instead, and three milliseconds against two is not a
+difference anyone can hear. And sustain zero turned out to be a real answer
+rather than a degenerate one — it is a drum: the noise channel's voice now ends
+itself when the decay runs out instead of looping static until the note-off.
+
+Cost on Cemu: **1 to 13 µs in a typical tick** against a 3000 µs frame, with the
+frame rate untouched at 60.1 and `sync 0.00 ms`. The worst-tick figure is not
+worth quoting from an emulator — it ranged from 52 µs to 650 µs across runs of
+the same binary, which is the JIT and the host scheduler, not the code.
+Hardware said 14 µs for the sequencer before envelopes existed and will be the
+one to say what they cost. **Not yet measured on hardware.**
+
 ### What loading actually costs (measured on console)
 
 Loading a 14.5 KB mesh and a 341 KB mipped texture from the SD card under

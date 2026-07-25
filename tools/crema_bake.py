@@ -43,6 +43,7 @@ import struct
 import sys
 
 VERSION = 1
+BANK_VERSION = 2    # v2 carries the envelope; the other formats are still v1
 HEADER_SIZE = 64
 TEX_HEADER_SIZE = 32
 
@@ -299,17 +300,25 @@ def bake_texture(src, dst, mips=True):
           % (dst, w, h, len(levels), os.path.getsize(dst)))
 
 
-# .cbank layout — an instrument is a sample plus the two numbers a WAV cannot
-# carry: where the loop starts, and how long one cycle is. That second number is
-# what makes it an instrument rather than a noise: a voice playing a cycle of
-# `cycleSamples` at rate R sounds at R/cycleSamples Hz, so a note is a playback
-# rate and nothing else. Zero means "not pitched" — drive the rate yourself.
+# .cbank layout — an instrument is a sample plus the numbers a WAV cannot carry:
+# where the loop starts, how long one cycle is, and what the note does over its
+# own lifetime. The cycle is what makes it an instrument rather than a noise: a
+# voice playing a cycle of `cycleSamples` at rate R sounds at R/cycleSamples Hz,
+# so a note is a playback rate and nothing else. Zero means "not pitched" —
+# drive the rate yourself.
+#
+# v2 added the sixteen bytes after `flags`: attack, decay, sustain, release, and
+# a vibrato. They are the difference between a note and a rectangle, and an
+# instrument that leaves them all zero gets the rectangle it had in v1.
 #    0  magic 'CBNK' | 4 version | 8 count | 12 rate | 16 reserved[4]  = 32
 #   32  count x { name[24], offset, sampleCount, loopStart, cycleSamples,
-#                flags }                                               = 44
+#                flags,
+#                attackMs:u16, decayMs:u16, sustain:u16 (per mille),
+#                releaseMs:u16, vibDelayMs:u16, vibRateMilliHz:u16,
+#                vibDepthCents:s16, reserved:u16 }                     = 60
 #       PCM16 payloads, 64-byte aligned, offsets from the start of file
 BANK_HEADER_SIZE = 32
-BANK_ENTRY_SIZE = 44
+BANK_ENTRY_SIZE = 60
 BANK_FLAG_LOOPING = 1
 
 
@@ -335,6 +344,29 @@ def read_wav_mono16(path):
         raise SystemExit("%s: need 16-bit mono PCM, got %d-bit %d-channel "
                          "format %d" % (path, bits, channels, tag))
     return pcm, rate
+
+
+def _clamp(v, lo, hi, what):
+    if v < lo or v > hi:
+        raise SystemExit("%s out of range: %s (expected %s..%s)"
+                         % (what, v, lo, hi))
+    return v
+
+
+def ms(v):
+    return _clamp(int(round(float(v))), 0, 65535, "a time in ms")
+
+
+def permille(v):
+    return _clamp(int(round(float(v) * 1000.0)), 0, 1000, "a sustain level")
+
+
+def milli_hz(v):
+    return _clamp(int(round(float(v) * 1000.0)), 0, 65535, "a vibrato rate")
+
+
+def cents(v):
+    return _clamp(int(round(float(v))), -32768, 32767, "a vibrato depth")
 
 
 def bake_bank(dst, manifest_path):
@@ -364,23 +396,46 @@ def bake_bank(dst, manifest_path):
 
     total = offset
     with open(dst, "wb") as fh:
-        fh.write(struct.pack(">4s3I4I", b"CBNK", VERSION, len(entries), rate,
-                             0, 0, 0, 0))
+        fh.write(struct.pack(">4s3I4I", b"CBNK", BANK_VERSION, len(entries),
+                             rate, 0, 0, 0, 0))
         for name, off, pcm, inst in entries:
             flags = BANK_FLAG_LOOPING if inst.get("loop") else 0
+            env = inst.get("envelope", {})
+            vib = inst.get("vibrato", {})
             fh.write(struct.pack(">24sIIIII", name, off, len(pcm) // 2,
                                  inst.get("loopStart", 0),
                                  inst.get("cycleSamples", 0), flags))
+            # Sustain is written in thousandths because a fraction in a binary
+            # file is a mistake waiting to be found by someone with a hex editor.
+            fh.write(struct.pack(">HHHHHHhH",
+                                 ms(env.get("attack", 0)),
+                                 ms(env.get("decay", 0)),
+                                 permille(env.get("sustain", 0.0)),
+                                 ms(env.get("release", 0)),
+                                 ms(vib.get("delay", 0)),
+                                 milli_hz(vib.get("rate", 0.0)),
+                                 cents(vib.get("depth", 0)), 0))
         for name, off, pcm, inst in entries:
             fh.write(b"\0" * (off - fh.tell()))
             fh.write(pcm)
         fh.write(b"\0" * (total - fh.tell()))
 
     for name, off, pcm, inst in entries:
-        print("    %-10s %7d samples%s%s" % (
+        env, vib = inst.get("envelope"), inst.get("vibrato")
+        shape = ""
+        if env:
+            shape = "  adsr %d/%d/%.2f/%d" % (env.get("attack", 0),
+                                              env.get("decay", 0),
+                                              env.get("sustain", 0.0),
+                                              env.get("release", 0))
+        if vib and vib.get("depth"):
+            shape += "  vib %.1f Hz %+d cents after %d ms" % (
+                vib.get("rate", 0.0), vib["depth"], vib.get("delay", 0))
+        print("    %-10s %7d samples%s%s%s" % (
             name.decode(), len(pcm) // 2,
             "  loop@%d" % inst.get("loopStart", 0) if inst.get("loop") else "",
-            "  cycle %d" % inst["cycleSamples"] if inst.get("cycleSamples") else ""))
+            "  cycle %d" % inst["cycleSamples"] if inst.get("cycleSamples") else "",
+            shape))
     print("  %s: %d instruments, %d Hz, %d bytes"
           % (dst, len(entries), rate, total))
 

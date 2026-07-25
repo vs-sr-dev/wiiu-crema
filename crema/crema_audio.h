@@ -93,6 +93,21 @@ void CremaAudioVoiceRetrigger(CremaAudioVoice *voice, const CremaSound *snd,
 // Note off: stop it, but keep the voice — the channel still owns it.
 void CremaAudioVoiceSilence(CremaAudioVoice *voice);
 
+// Volume and pitch for the next `samples` of this voice, as a ramp the DSP
+// walks by itself.
+//
+// This exists because a sequencer thinks 333 times a second and the ear hears
+// 48000. Writing a volume once per audio frame and leaving it there turns every
+// fade into a staircase of 3 ms steps, and a staircase in a volume is a buzz.
+// An AX voice carries a volume *and* a per-sample delta, so the hardware
+// interpolates between the two numbers you hand it: the sequencer says "from
+// here to there, over this frame", and the envelope comes out smooth at the
+// sample rate for the price of one extra field.
+//
+// Safe from the audio thread — it is four writes to voice state and no more.
+void CremaAudioVoiceRamp(CremaAudioVoice *voice, float from, float to,
+                         uint32_t samples, float pitch);
+
 // Once per frame: hands back the voices whose one-shots have finished. Without
 // it the pool fills up after a few dozen shots and the game goes quiet.
 void CremaAudioUpdate(void);

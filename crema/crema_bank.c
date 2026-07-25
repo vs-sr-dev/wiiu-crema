@@ -8,7 +8,7 @@
 #include <string.h>
 #include <whb/log.h>
 
-#define CBANK_VERSION 1
+#define CBANK_VERSION 2
 #define CBANK_HEADER_SIZE 32
 #define CBANK_FLAG_LOOPING 1
 
@@ -31,8 +31,14 @@ typedef struct {
     uint32_t loopStart;
     uint32_t cycleSamples;
     uint32_t flags;
+    // v2: the shape of a note. Sixteen bytes that do more for how this sounds
+    // than every sample in the file put together.
+    uint16_t attackMs, decayMs, sustain, releaseMs;
+    uint16_t vibDelayMs, vibRateMilliHz;
+    int16_t  vibDepthCents;
+    uint16_t reserved;
 } BankEntry;
-_Static_assert(sizeof(BankEntry) == 44, "cbank entry is 44 bytes");
+_Static_assert(sizeof(BankEntry) == 60, "cbank entry is 60 bytes");
 
 bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
 {
@@ -76,6 +82,13 @@ bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
         memcpy(inst->name, e.name, sizeof(inst->name));
         inst->name[sizeof(inst->name) - 1] = '\0';
         inst->cycleSamples = e.cycleSamples;
+        inst->env.attackMs   = e.attackMs;
+        inst->env.decayMs    = e.decayMs;
+        inst->env.sustain    = e.sustain;
+        inst->env.releaseMs  = e.releaseMs;
+        inst->vib.delayMs     = e.vibDelayMs;
+        inst->vib.rateMilliHz = e.vibRateMilliHz;
+        inst->vib.depthCents  = e.vibDepthCents;
 
         // Copied, not referenced: the DSP reads these samples while the voice
         // plays, long after whatever we were handed has been freed.

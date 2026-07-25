@@ -248,15 +248,23 @@ makes the grid unambiguous:
 - **an empty step is a rest, not a held note.** The DAW piano-roll convention,
   and the opposite of FamiTracker, where a blank cell sustains and rests have
   to be written.
-- **a held note is the same note on contiguous steps.** Two cells of C#4 are
-  one note two cells long, not two attacks — the grid is run-length encoded,
-  the way a piano roll's rectangle looks when you drag its edge. The importer
-  coalesces runs rather than counting them.
+- a run of the same note over contiguous steps is *usually* one held note —
+  and this is the one thing the importer cannot know for certain.
 
-They cooperate exactly because the second needs *contiguous* cells: two notes
-of the same pitch with a rest between them stay two attacks. The price of the
-grammar is that a note cannot be retriggered at the same pitch on the very next
-step — to strike it twice you leave a cell.
+chiproll distinguishes a note dragged across two cells from two single notes
+side by side, but **its JSON export does not carry the distinction**: sixteen
+separate G3s and one G3 held across sixteen cells serialise to sixteen
+identical cells, differing only in their index. No reader can recover that, so
+the importer looks for an explicit tie flag, uses it if it is ever there, and
+otherwise reports every run it had to guess at — a silent guess about note
+lengths is a silent guess about the music. `--runs=attacks` takes the other
+reading.
+
+(The same session exported to FamiTracker text loses it too, in the opposite
+direction: it writes the note on all sixteen rows, and in a tracker a blank row
+*sustains*, so that spelling means sixteen attacks. The difference is that the
+tracker format has the vocabulary and is not using it, while the JSON has no
+vocabulary for it at all.)
 
 ### The sequencer runs on AX's clock, not on yours
 

@@ -24,15 +24,21 @@ confirmed by its author:
     on purpose, taken from DAW piano rolls and against the tracker habit:
     FamiTracker makes you write the rest, and leaving the cell blank sustains
     what came before. Here blank means silence.
-  - **a held note is the same note repeated over contiguous steps.** Two cells
-    of C#4 are one note two cells long, not two attacks — the grid is
-    run-length encoded, the way a piano roll's rectangle looks when you drag
-    its edge. So this importer coalesces runs rather than counting them, and
-    the price of that grammar is that a note cannot be immediately retriggered
-    at the same pitch: to strike it twice you leave a cell between.
+  - a run of the same note over contiguous steps is *usually* one held note.
 
-The two conventions cooperate exactly because the second needs *contiguous*
-cells: notes of the same pitch separated by a rest stay separate attacks.
+That second one is where this importer has to guess, and it should not have to.
+chiproll distinguishes a note dragged across two cells from two single notes
+side by side — but **its JSON export does not carry the distinction**. Sixteen
+separate G3s and one G3 held for sixteen cells serialise to sixteen identical
+cells, differing only in their index. There is no field in the file that could
+say which, so no reader can recover it.
+
+The fix belongs upstream and is small: a boolean per cell (`"tie": true` on
+continuation cells) is additive, and any reader ignoring it behaves exactly as
+today. This importer already looks for such a flag under several plausible
+names, uses it when it finds one, and falls back to `--runs` otherwise —
+reporting every run it had to guess at, because a silent guess about note
+lengths is a silent guess about the music.
 
 A step is a sixteenth note by default (--steps-per-beat), which is the one
 thing chiproll leaves to the reader. --gate sets how much of a note's last
@@ -94,25 +100,53 @@ def midi_from_name(name):
         return None
 
 
-def runs(steps):
-    """Walk a channel's grid and yield (first step, how many cells it holds).
+# Cell fields that would say, explicitly, whether a cell continues the note
+# before it. None of them exist in the exports seen so far — which is the whole
+# problem below — but reading them costs nothing and the day one appears this
+# importer becomes exact instead of assuming.
+TIE_KEYS = ("tie", "held", "continue", "sustain")
+ATTACK_KEYS = ("attack", "trigger", "start")
 
-    The same note on contiguous cells is one held note. Identity is the note
-    *and* its register, because the register is what the chip is actually given
-    and two cells that disagree about it are two different sounds however they
-    are spelled."""
+
+def cell_continues(cell):
+    """True / False if the file says, None if the file does not say."""
+    for k in TIE_KEYS:
+        if k in cell and cell[k] is not None:
+            return bool(cell[k])
+    for k in ATTACK_KEYS:
+        if k in cell and cell[k] is not None:
+            return not bool(cell[k])
+    return None
+
+
+def runs(steps, assume_held=True):
+    """Walk a channel's grid and yield (first cell, how many cells it holds,
+    ambiguous).
+
+    A run is contiguous cells carrying the same note *and* the same register —
+    the register is what the chip is actually given, and two cells that
+    disagree about it are two different sounds however they are spelled.
+
+    Whether such a run is ONE held note or several attacks is a question the
+    export cannot answer: sixteen separate G3s and one G3 dragged across
+    sixteen cells serialise to the same sixteen identical cells. chiproll knows
+    the difference; its JSON does not carry it. So a run with no explicit tie
+    flag is reported as ambiguous, and `assume_held` decides what to do until
+    the exporter says."""
     out = []
     for st in steps:
         if st.get("note") is None:
             continue
         key = (st["note"], st.get("register"))
+        told = cell_continues(st)
         if out:
-            prev, length = out[-1]
-            if (st["step"] == prev["step"] + length and
-                    (prev["note"], prev.get("register")) == key):
-                out[-1] = (prev, length + 1)
+            prev, length, ambiguous = out[-1]
+            contiguous = (st["step"] == prev["step"] + length and
+                          (prev["note"], prev.get("register")) == key)
+            if contiguous and (told is True or (told is None and assume_held)):
+                out[-1] = (prev, length + 1, ambiguous or told is None)
                 continue
-        out.append((st, 1))
+        out.append((st, 1, False))
     return out
 
 
@@ -127,7 +161,8 @@ def noise_note(register):
     return int(round(note)), int(round((note - round(note)) * 100))
 
 
-def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
+def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True,
+            assume_held=True):
     bpm = session.get("bpm", 120)
     chip = session.get("active_chip", "NES")
     mapping = CHANNEL_MAP.get(chip)
@@ -143,6 +178,7 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
     instruments, events = [], []
     used = 0
     report = []
+    ambiguities = []
     for chan in channels:
         if chan.get("muted"):
             continue
@@ -161,9 +197,12 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
         notes = 0
         detuned = 0
         held = 0
-        for step, length in runs(chan["steps"]):
+        guessed = 0
+        for step, length, ambiguous in runs(chan["steps"], assume_held):
             if length > 1:
                 held += 1
+            if ambiguous:
+                guessed += 1
             if chan.get("kind") == "noise":
                 note, cents = noise_note(step.get("register"))
             else:
@@ -188,13 +227,16 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True):
                       % (chan["id"], inst_name, notes,
                          ", %d held" % held if held else "",
                          ", %d off the ideal pitch" % detuned if detuned else ""))
+        if guessed:
+            ambiguities.append((chan["id"], guessed))
 
     events.sort(key=lambda e: (e[0], e[2]))
     end_ms = int(round(step_count * step_ms))
     return {
         "bpm": bpm, "chip": chip, "channels": used,
         "instruments": instruments, "events": events,
-        "end_ms": end_ms, "report": report,
+        "end_ms": end_ms, "report": report, "ambiguities": ambiguities,
+        "assume_held": assume_held,
     }
 
 
@@ -219,7 +261,8 @@ def main():
     if len(args) != 2:
         print(__doc__ or "")
         print("usage: chiproll_import.py <session.json> <out.csong> "
-              "[--steps-per-beat=4] [--gate=0.95] [--equal-temperament]")
+              "[--steps-per-beat=4] [--gate=0.95] [--equal-temperament] "
+              "[--runs=held|attacks]")
         raise SystemExit(2)
 
     with open(args[0]) as fh:
@@ -227,7 +270,8 @@ def main():
     song = convert(session,
                    steps_per_beat=int(flags.get("--steps-per-beat", 4)),
                    gate=float(flags.get("--gate", 0.95)),
-                   keep_cents="--equal-temperament" not in flags)
+                   keep_cents="--equal-temperament" not in flags,
+                   assume_held=flags.get("--runs", "held") != "attacks")
     write_csong(args[1], song)
 
     print("importing %s session at %d BPM" % (song["chip"], song["bpm"]))
@@ -236,6 +280,15 @@ def main():
     print("  %s: %d events, %d channels, %d instruments, %.2f s"
           % (args[1], len(song["events"]), song["channels"],
              len(song["instruments"]), song["end_ms"] / 1000.0))
+    if song["ambiguities"]:
+        total = sum(n for _, n in song["ambiguities"])
+        print("  NOTE: %d run%s of repeated cells (%s) carry no tie flag, so "
+              "the file cannot say whether they are held notes or repeated "
+              "attacks. Read as %s; --runs=%s for the other reading."
+              % (total, "" if total == 1 else "s",
+                 ", ".join("%s x%d" % (c, n) for c, n in song["ambiguities"]),
+                 "HELD" if song["assume_held"] else "ATTACKS",
+                 "attacks" if song["assume_held"] else "held"))
 
 
 if __name__ == "__main__":

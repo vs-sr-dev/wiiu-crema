@@ -156,7 +156,7 @@ int main(int argc, char **argv)
     double loadMs = (double)OSTicksToMicroseconds(OSGetSystemTime() - loadStart)
                     / 1000.0;
     if (!loaded) {
-        WHBLogPrintf("[poc10] asset load failed — is the content dir bundled?");
+        WHBLogPrintf("[poc10] asset load failed - is the content dir bundled?");
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;

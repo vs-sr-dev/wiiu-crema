@@ -760,7 +760,7 @@ int main(int argc, char **argv)
                 CremaEntityDespawn(&enemies, best);
                 spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
                 score++;
-                WHBLogPrintf("[flight] hit at %.0f m — score %u", bestDist, score);
+                WHBLogPrintf("[flight] hit at %.0f m - score %u", bestDist, score);
             }
         }
 

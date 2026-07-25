@@ -192,6 +192,14 @@ one per PoC. If you write GX2 code, this list is the part you want:
 6. **Mipmaps are not optional.** A minified no-mip ground texture thrashes the
    texture cache: 60 → 30 fps from just looking down. Box-filter a chain,
    upload per level via `GX2CopySurface`, sample trilinear.
+7. **The Wii U Menu's music keeps playing until you take AX.** The system does
+   not stop its own audio when it launches you — it hands it over as
+   *transition audio* and waits for the title to end it. Every PoC here ran
+   with the menu humming underneath until one of them called `AXInit`.
+   Measured, not guessed: `__OSGetSavedAudioFlags()` reads **0x1 before
+   `AXInit` and 0x0 after** on hardware (in Cemu it is 0x0 either side — the
+   emulator never hands you anything, so this one is invisible there). Init
+   audio *first*, before you load a single asset.
 
 Also: front faces are **CCW seen from outside** with culling on, and tiled
 textures (`GX2_TILE_MODE_DEFAULT`, GPU-swizzled from a linear staging copy)

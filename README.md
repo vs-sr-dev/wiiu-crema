@@ -4,10 +4,10 @@
 of *Espresso* (the CPU) and *Latte* (the GPU), like any good crema should.
 
 Crema is a small, honest layer: runtime GLSL shaders, cache-safe resource
-handling, frame pacing, and the hard-earned lessons of getting GX2 code from
-the Cemu emulator onto real silicon. It ships with nine progressive examples,
-each one verified on real hardware, culminating in a fly-through 3D scene at
-a rock-solid 59.94 fps with the CPU fully idle.
+handling, frame pacing, sound, and the hard-earned lessons of getting GX2 code
+from the Cemu emulator onto real silicon. It ships with eleven progressive
+examples, each one verified on real hardware, culminating in a flyable game —
+59.9 fps, the CPU idle, and an engine note that follows the throttle.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
@@ -30,6 +30,12 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   next frame's uniforms safe while the GPU still reads the last one
 - **crema_mesh** — baked `.cmesh` loading: no parsing, no byteswap, file bytes
   read straight into GPU buffers, and the file describes its own vertex layout
+- **crema_blend** — blend mode (opaque / alpha / additive) and depth as two
+  calls, with test and write as separate switches: the transparent pass wants
+  test on and write off, or overlapping billboards punch holes in each other
+- **crema_effect** — timed billboard effects (flashes, tracers, explosions).
+  What separates an effect from an entity is that an effect knows it is going
+  to die: it carries its own lifetime and packs itself into an instance array
 - **crema_input** — GamePad polling with rescaled dead zones and, the part that
   matters, edge-triggered buttons: `held` fires a gun sixty times a second
 - **crema_entity** — a pool of world objects over caller-owned storage, so
@@ -171,8 +177,8 @@ the part that paid off, not the optimisation it shipped with.
 
 ## Lessons learned (Cemu vs real hardware)
 
-All of these render fine in Cemu and fail on the console — found the hard way,
-one per PoC. If you write GX2 code, this list is the part you want:
+All of these look fine in Cemu and are wrong on the console — found the hard
+way, roughly one per PoC. If you write GX2 code, this list is the part you want:
 
 1. **`GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK)`** is required on
    hardware for CafeGLSL shaders; Cemu renders without it.
@@ -242,6 +248,9 @@ compiler entirely (the Immaterial demo pattern).
   cycles/triangle — near the 1 tri/clock setup limit. ~2.2M tris/frame @ 60 fps.
 - Fill: **1.67 Gpix/s** opaque (≈30 fullscreen 720p layers per frame @ 60).
 - Heavy per-pixel math (≈10 transcendentals): ~2.7 ms per fullscreen 720p pass.
+- Audio: AX reports **96 voices** over a 48 kHz mix, resampling each one from
+  whatever rate you baked it at. A handful playing cost nothing we could
+  measure — the frame stayed at 59.9 fps with 0.00 ms of CPU sync.
 - Engine recipe that gets you there: static vertex/uniform data, animation in
   the vertex shader, instancing, fenced pacing — CPU cost ≈ 0.1 ms/frame.
 

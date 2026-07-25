@@ -340,12 +340,18 @@ difference anyone can hear. And sustain zero turned out to be a real answer
 rather than a degenerate one — it is a drum: the noise channel's voice now ends
 itself when the decay runs out instead of looping static until the note-off.
 
-Cost on Cemu: **1 to 13 µs in a typical tick** against a 3000 µs frame, with the
-frame rate untouched at 60.1 and `sync 0.00 ms`. The worst-tick figure is not
-worth quoting from an emulator — it ranged from 52 µs to 650 µs across runs of
-the same binary, which is the JIT and the host scheduler, not the code.
-Hardware said 14 µs for the sequencer before envelopes existed and will be the
-one to say what they cost. **Not yet measured on hardware.**
+Cost, measured on hardware: **1-2 µs in a typical tick and 8-16 µs in the worst**
+against a 3000 µs frame, at 59.9 fps with `sync 0.00 ms`. The sequencer's worst
+tick was 14 µs before any of this existed, so **envelopes and vibrato for four
+channels cost about two microseconds**. (Cemu reported 1-13 µs typical and a
+worst tick that wandered between 52 and 650 µs across runs of the same binary —
+the JIT and the host scheduler, not the code. Worst-case timings are not worth
+quoting from an emulator.)
+
+They also cost less volume than they save. With envelopes off the mix meter read
+72% of full scale and with them on 63%: a rectangle holds full volume for the
+whole note, an envelope falls to its sustain, so the same music through the same
+speakers leaves more headroom for everything else.
 
 ### Our own code inside AX's signal path
 
@@ -382,17 +388,56 @@ the third argument arriving exactly where it was predicted to.
 The one thing an emulator could not answer was the numeric scale. Cemu stores
 aux samples shifted right by eight with a comment saying it is not sure why, so
 the effect measures its own peak instead of assuming: **13090 on a mix of five
-voices at a 0.45 send**, which settles it — the buffer is at int16 scale, ±32767,
-not the ±128 that reading the shift alone would suggest.
+voices at a 0.45 send**, and the same order of magnitude again on the console,
+which settles it — the buffer is at int16 scale, ±32767, not the ±128 that
+reading the shift alone would suggest.
 
 An echo — 170 ms, feedback, in plain C in a file that includes no console header
-— costs **6-8 µs per call against a 3000 µs frame**, about 0.2% of the audio
-thread. That is the number that says a reverb is affordable. Two caveats worth
-having in writing: **Cemu does not implement the GamePad's aux path at all**
-(its mixer stores the TV aux buses and leaves the DRC ones a `// todo`), the one
-place where the emulator is stricter than the console; and there is no cache
-maintenance around these buffers here, on the theory that AX presents them
-coherently — untested, and the kind of thing only hardware can settle.
+— costs **12-13 µs per call against a 3000 µs frame on hardware**, about 0.4% of
+the audio thread. That is the number that says a reverb is affordable.
+
+Two caveats worth having in writing. **Cemu does not implement the GamePad's aux
+path at all** (its mixer stores the TV aux buses and leaves the DRC ones a
+`// todo`), the one place where the emulator is stricter than the console. And
+there is **no cache maintenance around these buffers**, on the theory that AX
+presents them coherently — which hardware confirmed: 6 channels of 144 samples
+arriving 333.6 times a second with sane, stable peaks, so Nintendo's own effect
+library was not doing it either.
+
+### The emulator lied about this one, and in the other direction
+
+The sequencer was cheaper on hardware than in Cemu — 14 µs against 42 — and it
+was tempting to generalise. The echo went the other way: **23 µs on console
+against 6-8 in Cemu**, three times worse on the real machine. So the effect was
+taken apart against the clock, on hardware, one hypothesis at a time.
+
+| | cost per call | what was removed |
+|---|---|---|
+| as written | 23 µs | |
+| without the `%` | **−5 µs** | two integer divisions per sample |
+| in fixed point | **−5.5 µs** | the int↔float conversions |
+| what is left | **12.5 µs** | memory |
+
+Two of those are properties of this CPU rather than of this effect:
+
+**A modulo is a division.** `write = (cursor + i) % length` reads like index
+arithmetic and compiles to `divwu`, which on Espresso is about twenty cycles and
+does not pipeline. An index that only ever advances by one wraps at most once,
+so a comparison says the same thing in a cycle. Two divisions per sample were
+more arithmetic than the entire effect.
+
+**There is no instruction that turns an integer into a float.** A compiler
+writes `(float)sample` as a store and a load through memory, and the same again
+coming back, so a DSP loop over integer samples pays a memory round trip per
+conversion — three of them per sample here. In 12-bit fixed point the same gain
+is a multiply and a shift.
+
+What remains is genuinely memory. 54 cycles a sample for about fourteen
+instructions is not arithmetic; it is a 76 KB delay line against a 32 KB L1,
+with a read head and a write head 8160 samples apart. The estimate that got
+there was wrong in detail — a conversion cost 8 cycles, not the 20 predicted —
+which is the argument for measuring rather than reasoning: both hypotheses were
+right, one behind the other, and only the clock could say in what proportion.
 
 ### The mix had no headroom, and a second aux bus proved it
 
@@ -413,8 +458,8 @@ with nobody even shooting:
 Not "close to clipping" — nearly twice over, continuously. `CremaAudioSetHeadroom`
 scales every voice's main bus *and its sends together*, so turning it down costs
 volume and never balance, and an effect stays in the same proportion to the dry
-signal. At 0.35 the same scene reads **55-69%**, with the echo's return
-accounting for another 28% on top of that.
+signal. At 0.35 the same scene reads **55-69%** in Cemu and **30-72%** on the
+console, with the echo's return accounting for another 25% on top of that.
 
 The general lesson is not about this game. **A mixer that only adds has no idea
 how loud it is**, and neither does anyone reading the code; the number was

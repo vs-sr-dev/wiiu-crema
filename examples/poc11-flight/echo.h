@@ -20,8 +20,12 @@
 //
 // The samples are int32 and their scale is not assumed anywhere: every path
 // through here is linear, so a delay does the same thing to numbers in ±128 as
-// to numbers in ±32767. That matters, because what scale AX actually uses in
-// an aux buffer is exactly the thing we do not know yet — hence `peak`.
+// to numbers in ±32767. That matters, because what scale AX uses in an aux
+// buffer is undocumented — `peak` is how it was found (32767, measured on the
+// console) and how it stays honest if it is ever different somewhere else.
+//
+// The arithmetic is fixed point rather than floating, and that is a measurement
+// too, not a preference. See `feedbackQ`.
 
 #pragma once
 #include <stdint.h>
@@ -38,6 +42,17 @@ typedef struct {
     uint32_t delaySamples;  // how far back the tap is
     float    feedback;      // how much of the tap goes back in: < 1 or it grows
     float    wet;           // how much of the tap comes out
+
+    // The same two gains in 12-bit fixed point, which is what the loop actually
+    // uses. Not premature: this CPU has no instruction that turns an integer
+    // into a float, so a compiler writes one as a store and a load through
+    // memory, and the same again coming back. Three of those per sample was
+    // most of the cost of the entire effect — measured, 18 µs a call against
+    // the 3000 µs frame, before this. A gain in Q12 is a multiply and a shift.
+    //
+    // Q12 and not Q16 so the product stays inside 32 bits without help: a tap
+    // would have to reach 524288 to overflow, and these run in the thousands.
+    int32_t  feedbackQ, wetQ;
 
     // What the effect has seen. The peak is not a diagnostic afterthought: the
     // numeric range of an AX aux buffer is undocumented, Cemu's mixer stores it
@@ -62,8 +77,10 @@ static inline void echoInit(Echo *e, int32_t *buffer, uint32_t length,
     if (delaySamples >= length)
         delaySamples = length - 1;
     e->delaySamples = delaySamples;
-    e->feedback = feedback;
-    e->wet      = wet;
+    e->feedback  = feedback;
+    e->wet       = wet;
+    e->feedbackQ = (int32_t)(feedback * 4096.0f);
+    e->wetQ      = (int32_t)(wet * 4096.0f);
     memset(buffer, 0, (size_t)length * channels * sizeof(int32_t));
 }
 
@@ -91,26 +108,45 @@ static inline void echoProcess(Echo *e, int32_t *const *data,
     if (!e->buffer || n == 0 || samples == 0)
         return;
 
-    // The cursor advances once for the whole block and every channel walks it
-    // in step: two channels running on different cursors is two rooms.
-    for (uint32_t i = 0; i < samples; i++) {
-        uint32_t write = (e->cursor + i) % e->length;
-        uint32_t read  = (write + e->length - e->delaySamples) % e->length;
+    uint32_t start = e->cursor;
+    uint32_t startRead = start >= e->delaySamples
+                       ? start - e->delaySamples
+                       : start + e->length - e->delaySamples;
+    uint32_t write = start;
 
-        for (uint32_t c = 0; c < n; c++) {
-            int32_t *line = e->buffer + (size_t)c * e->length;
-            int32_t in  = data[c][i];
-            int32_t tap = line[read];
+    // Channel outside, samples inside — the other way round is the obvious way
+    // to write it and the wrong one on this machine. Walking one channel's
+    // delay line end to end reads memory in a straight line; alternating
+    // between two lines 38 KB apart on every sample asks the cache to hold two
+    // moving windows instead of one. Every channel starts from the same cursor,
+    // so they still describe one room and not two.
+    for (uint32_t c = 0; c < n; c++) {
+        int32_t *line = e->buffer + (size_t)c * e->length;
+        int32_t *ch   = data[c];
+        uint32_t r = startRead, w = start;
 
-            int32_t out = in + (int32_t)((float)tap * e->wet);
-            line[write] = in + (int32_t)((float)tap * e->feedback);
-            data[c][i]  = out;
+        for (uint32_t i = 0; i < samples; i++) {
+            int32_t in  = ch[i];
+            int32_t tap = line[r];
+
+            int32_t out = in + ((tap * e->wetQ) >> 12);
+            line[w] = in + ((tap * e->feedbackQ) >> 12);
+            ch[i]   = out;
 
             int32_t a = in  < 0 ? -in  : in;
             int32_t b = out < 0 ? -out : out;
             if (a > e->peakIn)  e->peakIn  = a;
             if (b > e->peakOut) e->peakOut = b;
+
+            // Not `(i + 1) % length`. A modulo is an integer division, and on
+            // this CPU `divwu` is about twenty cycles and does not pipeline —
+            // two of them per sample is more arithmetic than the entire effect.
+            // An index that only ever advances by one wraps at most once, and a
+            // comparison says so in a cycle.
+            if (++r >= e->length) r = 0;
+            if (++w >= e->length) w = 0;
         }
+        write = w;
     }
-    e->cursor = (e->cursor + samples) % e->length;
+    e->cursor = write;
 }

@@ -24,21 +24,23 @@ confirmed by its author:
     on purpose, taken from DAW piano rolls and against the tracker habit:
     FamiTracker makes you write the rest, and leaving the cell blank sustains
     what came before. Here blank means silence.
-  - a run of the same note over contiguous steps is *usually* one held note.
+  - a held note is the same note on contiguous steps — but *which* runs are held
+    was, for one version of the format, a thing no reader could recover.
 
-That second one is where this importer has to guess, and it should not have to.
-chiproll distinguishes a note dragged across two cells from two single notes
-side by side — but **its JSON export does not carry the distinction**. Sixteen
-separate G3s and one G3 held for sixteen cells serialise to sixteen identical
-cells, differing only in their index. There is no field in the file that could
-say which, so no reader can recover it.
+That second one used to be a guess. chiproll distinguishes a note dragged across
+two cells from two single notes side by side, and its first JSON export did not:
+sixteen separate G3s and one G3 held for sixteen cells serialised to sixteen
+identical cells, differing only in their index.
 
-The fix belongs upstream and is small: a boolean per cell (`"tie": true` on
-continuation cells) is additive, and any reader ignoring it behaves exactly as
-today. This importer already looks for such a flag under several plausible
-names, uses it when it finds one, and falls back to `--runs` otherwise —
-reporting every run it had to guess at, because a silent guess about note
-lengths is a silent guess about the music.
+**`format_version: 2` closed it**, with the smallest possible change — a
+boolean per cell, `"tie": true` on a continuation. Additive, so a reader that
+ignores it behaves exactly as before, and it removes the old convention's one
+real cost: because a tie is now stated rather than inferred from contiguity, the
+same note *can* be re-struck on the very next cell.
+
+This importer wanted that flag before it existed and looked for it under several
+plausible names, falling back to `--runs` and reporting every run it had to
+guess at. On a v2 file it guesses at nothing and the report says so.
 
 A step is a sixteenth note by default (--steps-per-beat), which is the one
 thing chiproll leaves to the reader. --gate sets how much of a note's last
@@ -127,12 +129,13 @@ def runs(steps, assume_held=True):
     the register is what the chip is actually given, and two cells that
     disagree about it are two different sounds however they are spelled.
 
-    Whether such a run is ONE held note or several attacks is a question the
-    export cannot answer: sixteen separate G3s and one G3 dragged across
-    sixteen cells serialise to the same sixteen identical cells. chiproll knows
-    the difference; its JSON does not carry it. So a run with no explicit tie
-    flag is reported as ambiguous, and `assume_held` decides what to do until
-    the exporter says."""
+    Whether such a run is ONE held note or several attacks is answered by the
+    cell's `tie` flag from format_version 2 onward. Before that the export could
+    not answer it at all — sixteen separate G3s and one G3 dragged across
+    sixteen cells serialise to the same sixteen identical cells — so a run with
+    no flag is still merged or not according to `assume_held`, and reported as
+    ambiguous either way. A silent guess about note lengths is a silent guess
+    about the music."""
     out = []
     for st in steps:
         if st.get("note") is None:
@@ -233,6 +236,7 @@ def convert(session, steps_per_beat=4, gate=0.95, keep_cents=True,
     events.sort(key=lambda e: (e[0], e[2]))
     end_ms = int(round(step_count * step_ms))
     return {
+        "format_version": session.get("format_version", 1),
         "bpm": bpm, "chip": chip, "channels": used,
         "instruments": instruments, "events": events,
         "end_ms": end_ms, "report": report, "ambiguities": ambiguities,
@@ -280,6 +284,12 @@ def main():
     print("  %s: %d events, %d channels, %d instruments, %.2f s"
           % (args[1], len(song["events"]), song["channels"],
              len(song["instruments"]), song["end_ms"] / 1000.0))
+    # Saying so out loud is the point: the difference between a file that states
+    # its note lengths and one this importer had to read them out of is not
+    # visible in the .csong, only in whether it is right.
+    if not song["ambiguities"] and song["format_version"] >= 2:
+        print("  the file states its own ties (format_version %d), so nothing "
+              "above was guessed" % song["format_version"])
     if song["ambiguities"]:
         total = sum(n for _, n in song["ambiguities"])
         print("  NOTE: %d run%s of repeated cells (%s) carry no tie flag, so "

@@ -176,3 +176,76 @@ void CremaMeshDestroy(CremaMesh *mesh)
         CremaBufferDestroy(&mesh->ibo);
     memset(mesh, 0, sizeof(*mesh));
 }
+
+// The same file, already in memory — which is what an archive hands you. The
+// path version above is now the special case: one asset, one file, and the
+// stream setup paid for it alone.
+bool CremaMeshLoadFromMemory(CremaMesh *mesh, const void *blob, size_t size,
+                             const char *label)
+{
+    memset(mesh, 0, sizeof(*mesh));
+    if (!blob || size < sizeof(MeshHeader)) {
+        WHBLogPrintf("[mesh] %s: too small to be a .cmesh", label);
+        return false;
+    }
+
+    const uint8_t *base = (const uint8_t *)blob;
+    MeshHeader h;
+    memcpy(&h, base, sizeof(h));
+    if (memcmp(h.magic, "CMSH", 4) != 0 || h.version != CMESH_VERSION ||
+        h.attribCount == 0 || h.attribCount > CREMA_MESH_MAX_ATTRIBS) {
+        WHBLogPrintf("[mesh] %s: not a v%d .cmesh", label, CMESH_VERSION);
+        return false;
+    }
+
+    size_t vertexBytes = (size_t)h.stride * h.vertexCount;
+    size_t indexBytes  = (size_t)sizeof(uint16_t) * h.indexCount;
+    // The archive is trusted no further than its own directory: a header that
+    // claims more bytes than the entry holds must not be believed.
+    if ((size_t)h.vertexOffset + vertexBytes > size ||
+        (size_t)h.indexOffset + indexBytes > size ||
+        sizeof(MeshHeader) + (size_t)h.attribCount * 12 > size) {
+        WHBLogPrintf("[mesh] %s: header points past the end of the blob", label);
+        return false;
+    }
+
+    bool ok = true;
+    for (uint32_t i = 0; i < h.attribCount && ok; i++) {
+        uint32_t entry[3];
+        memcpy(entry, base + sizeof(MeshHeader) + i * sizeof(entry),
+               sizeof(entry));
+        GX2AttribFormat format;
+        if (!attribFormat(entry[2], &format)) {
+            WHBLogPrintf("[mesh] %s: unknown attribute type %u", label, entry[2]);
+            ok = false;
+            break;
+        }
+        mesh->attribs[i].location = entry[0];
+        mesh->attribs[i].buffer   = 0;
+        mesh->attribs[i].offset   = entry[1];
+        mesh->attribs[i].format   = format;
+    }
+
+    if (ok)
+        ok = CremaBufferCreate(&mesh->vbo, GX2R_RESOURCE_BIND_VERTEX_BUFFER,
+                               h.stride, h.vertexCount, base + h.vertexOffset);
+    if (ok)
+        ok = CremaBufferCreate(&mesh->ibo, GX2R_RESOURCE_BIND_INDEX_BUFFER,
+                               sizeof(uint16_t), h.indexCount,
+                               base + h.indexOffset);
+    if (!ok) {
+        CremaMeshDestroy(mesh);
+        return false;
+    }
+
+    mesh->vertexCount = h.vertexCount;
+    mesh->indexCount  = h.indexCount;
+    mesh->stride      = h.stride;
+    mesh->attribCount = h.attribCount;
+    memcpy(mesh->aabbMin, h.aabbMin, sizeof(mesh->aabbMin));
+    memcpy(mesh->aabbMax, h.aabbMax, sizeof(mesh->aabbMax));
+
+    WHBLogPrintf("[mesh] %s: %u verts, %u tris, stride %u, %u attribs (from memory)",
+                 label, h.vertexCount, h.indexCount / 3, h.stride, h.attribCount);
+    return true;
+}

@@ -42,6 +42,7 @@
 #include "crema_input.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
+#include "crema_pak.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
 #include "hud.h"        // the readout: quads in screen space, no console either
@@ -692,11 +693,26 @@ int main(int argc, char **argv)
         return -1;
     }
 
+    // Three assets, one archive, two reads. PoC 10 measures why; this one just
+    // takes the answer and gets on with being a game.
     CremaMesh ship;
     GX2Texture hull, font;
-    if (!CremaMeshLoad(&ship, "/vol/content/ship.cmesh") ||
-        !CremaTextureLoad(&hull, "/vol/content/hull.ctex") ||
-        !CremaTextureLoad(&font, "/vol/content/font.ctex")) {
+    bool assetsOk = false;
+    {
+        CremaPak pak;
+        if (CremaPakOpen(&pak, "/vol/content/assets.cpak")) {
+            size_t meshBytes = 0, hullBytes = 0, fontBytes = 0;
+            const void *meshBlob = CremaPakFind(&pak, "ship.cmesh", &meshBytes);
+            const void *hullBlob = CremaPakFind(&pak, "hull.ctex", &hullBytes);
+            const void *fontBlob = CremaPakFind(&pak, "font.ctex", &fontBytes);
+            assetsOk = meshBlob && hullBlob && fontBlob &&
+                CremaMeshLoadFromMemory(&ship, meshBlob, meshBytes, "ship.cmesh") &&
+                CremaTextureLoadFromMemory(&hull, hullBlob, hullBytes, "hull.ctex") &&
+                CremaTextureLoadFromMemory(&font, fontBlob, fontBytes, "font.ctex");
+            CremaPakClose(&pak);   // the GPU has its copies now
+        }
+    }
+    if (!assetsOk) {
         WHBLogPrintf("[flight] asset load failed");
         CremaShaderShutdownCompiler();
         CremaAppShutdown();

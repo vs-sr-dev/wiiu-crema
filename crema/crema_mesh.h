@@ -42,6 +42,12 @@ typedef struct {
 // Load a .cmesh. Paths inside a .wuhb live under /vol/content/.
 bool CremaMeshLoad(CremaMesh *mesh, const char *path);
 
+// Same, from bytes already in memory — what a .cpak hands you (crema_pak.h).
+// `label` is only used for logging. Nothing is kept: the blob may be freed as
+// soon as this returns.
+bool CremaMeshLoadFromMemory(CremaMesh *mesh, const void *blob, size_t size,
+                             const char *label);
+
 // GX2RSetAttributeBuffer + GX2RDrawIndexed. instanceCount 1 = a single draw.
 void CremaMeshDraw(const CremaMesh *mesh, uint32_t instanceCount);
 

@@ -16,10 +16,25 @@ add_library(crema STATIC
     crema/crema_entity.c
     crema/crema_input.c
     crema/crema_mesh.c
+    crema/crema_pak.c
     crema/crema_shader.cpp
     crema/crema_texture.c
 )
 target_include_directories(crema PUBLIC crema external)
+
+# Archives are assembled at build time from the committed baked assets, so the
+# same bytes are not in the repository twice.
+find_program(CREMA_PYTHON NAMES python3 python REQUIRED)
+
+function(crema_pak output)
+    execute_process(COMMAND "${CREMA_PYTHON}"
+                    "${CMAKE_SOURCE_DIR}/tools/crema_bake.py" pak "${output}"
+                    ${ARGN}
+                    RESULT_VARIABLE result)
+    if(NOT result EQUAL 0)
+        message(FATAL_ERROR "crema_bake.py pak -> ${output} failed (${result})")
+    endif()
+endfunction()
 
 add_subdirectory(examples/poc1-triangle)
 add_subdirectory(examples/poc2-wirecube)

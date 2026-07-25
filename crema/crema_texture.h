@@ -43,6 +43,12 @@ bool CremaTextureUploadWithMips(GX2Texture *tex, const void *rgba8);
 // .wuhb live under /vol/content/.
 bool CremaTextureLoad(GX2Texture *tex, const char *path);
 
+// Same, from bytes already in memory — what a .cpak hands you (crema_pak.h).
+// `label` is only used for logging. Nothing is kept: the blob may be freed as
+// soon as this returns.
+bool CremaTextureLoadFromMemory(GX2Texture *tex, const void *blob, size_t size,
+                                const char *label);
+
 void CremaTextureDestroy(GX2Texture *tex);
 
 // Bilinear within a level + linear between levels — what a mip chain is for.

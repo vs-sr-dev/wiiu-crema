@@ -386,3 +386,75 @@ void CremaSamplerInitBilinear(GX2Sampler *sampler, GX2TexClampMode clampMode)
                            GX2_TEX_MIP_FILTER_MODE_NONE);
     GX2InitSamplerLOD(sampler, 0.0f, 0.0f, 0.0f);   // level 0 and nothing else
 }
+
+// The same .ctex, already in memory — which is what an archive hands you. All
+// that is left is the part that was never I/O: build the surface, push each
+// level through the staging copy, wait once for the GPU at the end.
+bool CremaTextureLoadFromMemory(GX2Texture *tex, const void *blob, size_t size,
+                                const char *label)
+{
+    memset(tex, 0, sizeof(*tex));
+    if (!blob || size < sizeof(TexHeader)) {
+        WHBLogPrintf("[texture] %s: too small to be a .ctex", label);
+        return false;
+    }
+
+    const uint8_t *base = (const uint8_t *)blob;
+    TexHeader h;
+    memcpy(&h, base, sizeof(h));
+    if (memcmp(h.magic, "CTEX", 4) != 0 || h.version != CTEX_VERSION ||
+        h.format != CTEX_FORMAT_RGBA8) {
+        WHBLogPrintf("[texture] %s: not a v%d RGBA8 .ctex", label, CTEX_VERSION);
+        return false;
+    }
+
+    uint32_t levels = h.mipLevels;
+    if (levels > CREMA_MAX_MIP_LEVELS)
+        levels = CREMA_MAX_MIP_LEVELS;
+
+    size_t needed = h.dataOffset;
+    for (uint32_t level = 0; level < levels; level++)
+        needed += (size_t)levelSize(h.width, level) *
+                  levelSize(h.height, level) * BYTES_PER_PIXEL;
+    if (needed > size) {
+        WHBLogPrintf("[texture] %s: header wants %u B, the entry holds %u",
+                     label, (uint32_t)needed, (uint32_t)size);
+        return false;
+    }
+
+    uint64_t createStart = OSGetSystemTime();
+    bool ok = createSurface(tex, h.width, h.height, levels,
+                            GX2_TILE_MODE_DEFAULT, false);
+    uint64_t createTicks = OSGetSystemTime() - createStart;
+
+    GX2Texture staging[CREMA_MAX_MIP_LEVELS];
+    uint32_t staged = 0;
+    uint64_t stageStart = OSGetSystemTime();
+    size_t offset = h.dataOffset;
+    for (uint32_t level = 0; level < levels && ok; level++) {
+        ok = stageLevel(tex, level, base + offset, &staging[staged]);
+        if (ok)
+            staged++;
+        offset += (size_t)levelSize(h.width, level) *
+                  levelSize(h.height, level) * BYTES_PER_PIXEL;
+    }
+    uint64_t stageTicks = OSGetSystemTime() - stageStart;
+
+    uint64_t syncStart = OSGetSystemTime();
+    settleStaging(staging, staged);
+    uint64_t syncTicks = OSGetSystemTime() - syncStart;
+
+    if (!ok) {
+        WHBLogPrintf("[texture] %s: upload failed", label);
+        CremaTextureDestroy(tex);
+        return false;
+    }
+
+    WHBLogPrintf("[texture] %s: %ux%u, %u levels, %u KB (from memory)",
+                 label, h.width, h.height, levels, (uint32_t)(size / 1024));
+    WHBLogPrintf("[texture]   create %.2f ms | stage %.2f ms | sync %.2f ms",
+                 (double)OSTicksToMicroseconds(createTicks) / 1000.0,
+                 (double)OSTicksToMicroseconds(stageTicks) / 1000.0,
+                 (double)OSTicksToMicroseconds(syncTicks) / 1000.0);
+    return true;
+}

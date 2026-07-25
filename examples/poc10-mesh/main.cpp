@@ -30,6 +30,7 @@
 #include "crema_input.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
+#include "crema_pak.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
 
@@ -148,20 +149,55 @@ int main(int argc, char **argv)
 
     // --- load the baked assets, and time it: nobody has published what the
     // Wii U romfs actually delivers to a homebrew loader ---
-    uint64_t loadStart = OSGetSystemTime();
+    //
+    // The same two assets are loaded twice, both ways, in the same run: once as
+    // loose files and once out of a .cpak. A benchmark taken on a different day
+    // on a different card is not a comparison, and the whole reason the archive
+    // exists is a number, so the number is measured here rather than argued.
     CremaMesh ship;
     GX2Texture hull;
+
+    uint64_t loadStart = OSGetSystemTime();
     bool loaded = CremaMeshLoad(&ship, "/vol/content/ship.cmesh") &&
                   CremaTextureLoad(&hull, "/vol/content/hull.ctex");
-    double loadMs = (double)OSTicksToMicroseconds(OSGetSystemTime() - loadStart)
-                    / 1000.0;
+    double looseMs = (double)OSTicksToMicroseconds(OSGetSystemTime() - loadStart)
+                     / 1000.0;
     if (!loaded) {
         WHBLogPrintf("[poc10] asset load failed - is the content dir bundled?");
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;
     }
-    WHBLogPrintf("[poc10] assets loaded in %.2f ms", loadMs);
+    // thrown away: what we keep is the pair loaded the other way, so that the
+    // thing being rendered is the thing that was measured second
+    CremaMeshDestroy(&ship);
+    CremaTextureDestroy(&hull);
+
+    uint64_t pakStart = OSGetSystemTime();
+    CremaPak pak;
+    double pakMs = 0.0;
+    if (CremaPakOpen(&pak, "/vol/content/assets.cpak")) {
+        size_t meshBytes = 0, texBytes = 0;
+        const void *meshBlob = CremaPakFind(&pak, "ship.cmesh", &meshBytes);
+        const void *texBlob  = CremaPakFind(&pak, "hull.ctex", &texBytes);
+        loaded = meshBlob && texBlob &&
+                 CremaMeshLoadFromMemory(&ship, meshBlob, meshBytes, "ship.cmesh") &&
+                 CremaTextureLoadFromMemory(&hull, texBlob, texBytes, "hull.ctex");
+        CremaPakClose(&pak);   // the GPU has its copies now
+    } else {
+        loaded = false;
+    }
+    pakMs = (double)OSTicksToMicroseconds(OSGetSystemTime() - pakStart) / 1000.0;
+    if (!loaded) {
+        WHBLogPrintf("[poc10] .cpak load failed");
+        CremaShaderShutdownCompiler();
+        CremaAppShutdown();
+        return -1;
+    }
+
+    WHBLogPrintf("[poc10] LOOSE FILES %.2f ms | ONE .cpak %.2f ms | %+.1f%%",
+                 looseMs, pakMs,
+                 looseMs > 0.0 ? (pakMs - looseMs) / looseMs * 100.0 : 0.0);
 
     // the mesh file describes its own vertex layout: hand it to the compiler
     CremaShader *shader = CremaShaderCompile(VS_SHIP, PS_SHIP,

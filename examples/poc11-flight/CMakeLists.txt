@@ -3,14 +3,19 @@ target_link_libraries(poc11_flight crema)
 
 wut_create_rpx(poc11_flight)
 
-# The bundle is assembled in the build tree instead of committing the same
-# bytes twice: the ship and its hull are PoC 10's baked assets (the pipeline's
-# output is content, not example code), the font atlas is this example's own.
+# One archive, assembled in the build tree: the ship and its hull are PoC 10's
+# baked assets (the pipeline's output is content, not example code), the font
+# atlas is this example's own. Three files went in, one goes into the .wuhb —
+# which is the whole point, since what an asset costs on this console is
+# dominated by touching its file at all.
 set(POC11_CONTENT "${CMAKE_CURRENT_BINARY_DIR}/bundle")
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/"
-     DESTINATION "${POC11_CONTENT}")
-file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/content/"
-     DESTINATION "${POC11_CONTENT}")
+# emptied first: the bundle is generated, and a file left behind by a previous
+# configure would be shipped forever without ever appearing in this list
+file(REMOVE_RECURSE "${POC11_CONTENT}")
+crema_pak("${POC11_CONTENT}/assets.cpak"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/ship.cmesh"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/hull.ctex"
+          "${CMAKE_CURRENT_SOURCE_DIR}/content/font.ctex")
 
 wut_create_wuhb(poc11_flight
     NAME      "GX2 PoC11 - Flight"

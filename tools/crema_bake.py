@@ -7,6 +7,7 @@
 #
 #   python tools/crema_bake.py mesh    in.obj  out.cmesh
 #   python tools/crema_bake.py texture in.png  out.ctex
+#   python tools/crema_bake.py pak     out.cpak  a.cmesh b.ctex ...
 #
 # Everything is written BIG-ENDIAN on purpose: the Wii U CPU is big-endian and
 # the GX2 fetch shader swaps attribute words for the GPU, so a baked file can
@@ -23,6 +24,17 @@
 #    0  magic 'CTEX' | 4 version | 8 width | 12 height | 16 mipLevels
 #   20  format (1 = RGBA8) | 24 dataOffset | 28 reserved            = 32
 #   32  every mip level, tightly packed, largest first
+#
+# .cpak layout — the shape is dictated by what was measured on the console:
+# opening a file costs ~0.15 ms, the FIRST read on a stream costs 3-4 ms
+# whatever its size, and every read after that 0.74 ms. So an archive is worth
+# having only if it can be loaded in a fixed number of reads no matter how many
+# assets are in it, and this one takes exactly two: the header says how long the
+# rest is, and the rest — directory and every payload — arrives in one go.
+#    0  magic 'CPAK' | 4 version | 8 entryCount | 12 totalSize
+#   16  reserved[4]                                                 = 32
+#   32  entryCount x { name[32], offset, size }                     = 40 each
+#       payloads, each 64-byte aligned, offsets counted from the start of file
 
 import os
 import struct
@@ -285,15 +297,67 @@ def bake_texture(src, dst, mips=True):
           % (dst, w, h, len(levels), os.path.getsize(dst)))
 
 
+PAK_HEADER_SIZE = 32
+PAK_ENTRY_SIZE = 40
+PAK_ALIGN = 64
+
+
+def bake_pak(dst, sources):
+    """Pack already-baked assets into one archive. Nothing is transformed here
+    — a .cpak is a directory and a concatenation, because the console's problem
+    was never the bytes, it was touching the files."""
+    entries = []
+    offset = PAK_HEADER_SIZE + PAK_ENTRY_SIZE * len(sources)
+    offset = (offset + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
+
+    for src in sources:
+        name = os.path.basename(src).encode("ascii")
+        if len(name) > 31:
+            raise SystemExit("%s: name longer than 31 characters" % src)
+        with open(src, "rb") as fh:
+            data = fh.read()
+        entries.append((name, offset, data))
+        offset += (len(data) + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
+
+    total = offset
+    with open(dst, "wb") as fh:
+        fh.write(struct.pack(">4s3I4I", b"CPAK", VERSION, len(entries), total,
+                             0, 0, 0, 0))
+        for name, off, data in entries:
+            fh.write(struct.pack(">32sII", name, off, len(data)))
+        for name, off, data in entries:
+            fh.write(b"\0" * (off - fh.tell()))
+            fh.write(data)
+        fh.write(b"\0" * (total - fh.tell()))
+
+    for name, off, data in entries:
+        print("    %-20s %8d bytes @ %d" % (name.decode(), len(data), off))
+    print("  %s: %d entries, %d bytes, loads in 2 reads"
+          % (dst, len(entries), total))
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = set(a for a in sys.argv[1:] if a.startswith("--"))
-    if len(args) != 3 or args[0] not in ("mesh", "texture"):
+    usage = ("usage: crema_bake.py {mesh|texture} <input> <output> [--no-mips]\n"
+             "       crema_bake.py pak <output.cpak> <input> [<input> ...]")
+    if len(args) < 3 or args[0] not in ("mesh", "texture", "pak"):
         print(__doc__ or "")
-        print("usage: crema_bake.py {mesh|texture} <input> <output> [--no-mips]")
+        print(usage)
         raise SystemExit(2)
 
-    kind, src, dst = args
+    kind = args[0]
+    if kind == "pak":
+        dst, sources = args[1], args[2:]
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        print("packing %d assets" % len(sources))
+        bake_pak(dst, sources)
+        return
+
+    if len(args) != 3:
+        print(usage)
+        raise SystemExit(2)
+    src, dst = args[1], args[2]
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     print("baking %s: %s" % (kind, src))
     if kind == "mesh":

@@ -30,7 +30,18 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   next frame's uniforms safe while the GPU still reads the last one
 - **crema_mesh** — baked `.cmesh` loading: no parsing, no byteswap, file bytes
   read straight into GPU buffers, and the file describes its own vertex layout
+- **crema_input** — GamePad polling with rescaled dead zones and, the part that
+  matters, edge-triggered buttons: `held` fires a gun sixty times a second
+- **crema_entity** — a pool of world objects over caller-owned storage, so
+  spawning never allocates mid-frame
+- **crema_collide** — bounding spheres from the AABB the baker put in the mesh,
+  sphere/sphere and ray/sphere. Spheres because an AABB stops bounding anything
+  the moment the object rotates
 - **crema_matrix** — column-major mat4/vec3 math, GL conventions
+
+Nothing here was designed in advance. Every module was extracted from an
+example that had already written it — twice, usually — which is why the layer
+is small and why each piece has a real caller.
 
 The whole engine-grade frame is four calls — this is [poc9](examples/poc9-scene/main.cpp)
 in full:
@@ -58,7 +69,8 @@ while (CremaAppRunning()) {
 | 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **1.67 Gpix/s** flat fill |
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
-| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 48 ms |
+| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 36 ms |
+| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot | 60 fps, CPU idle |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.

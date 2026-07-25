@@ -13,6 +13,8 @@
 //   - textured ground and fog exist to sell speed: without a reference
 //     surface, flying reads as hovering
 //   - fenced pacing, TV + GamePad, 60 fps with the CPU idle
+//   - and now it makes a noise: the guns, the hits, and an engine whose note
+//     rises with the throttle — one looping sample, resampled by the DSP
 
 #include <gx2/draw.h>
 #include <gx2/registers.h>
@@ -30,6 +32,7 @@
 #include <string.h>
 
 #include "crema_app.h"
+#include "crema_audio.h"
 #include "crema_blend.h"
 #include "crema_buffer.h"
 #include "crema_effect.h"
@@ -41,6 +44,7 @@
 #include "crema_mesh.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
+#include "sounds.h"     // the waveforms: plain C, no console in them at all
 
 #define NUM_WINGMEN 4
 #define NUM_SHIPS   (1 + NUM_WINGMEN)
@@ -439,6 +443,9 @@ int main(int argc, char **argv)
 {
     if (!CremaAppInit("poc11-flight"))
         return -1;
+    // First thing after the app is up, before a single asset is read: this is
+    // what takes the audio hardware away from the Wii U Menu's music.
+    CremaAudioInit();
     if (!CremaShaderInitCompiler()) {
         CremaAppShutdown();
         return -1;
@@ -566,6 +573,30 @@ int main(int argc, char **argv)
     CremaUniformRingCreate(&fxRing, sizeof(float) * 4 * 2 * MAX_EFFECTS,
                            CREMA_FRAMES_IN_FLIGHT);
 
+    // --- the sounds, cooked once into DSP memory --------------------------
+    // One scratch buffer, three sounds, ~85 KB of PCM. Baking them here costs a
+    // few milliseconds at startup; the alternative is a synthesiser running
+    // every frame for sounds that never change.
+    CremaSound sndLaser, sndBoom, sndEngine;
+    memset(&sndLaser, 0, sizeof(sndLaser));
+    memset(&sndBoom,  0, sizeof(sndBoom));
+    memset(&sndEngine, 0, sizeof(sndEngine));
+    {
+        int16_t *scratch = (int16_t *)malloc(SND_MAX_SAMPS * sizeof(int16_t));
+        if (scratch) {
+            uint32_t n;
+            n = bakeLaser(scratch);
+            CremaSoundCreate(&sndLaser, scratch, n, SND_RATE);
+            n = bakeBoom(scratch);
+            CremaSoundCreate(&sndBoom, scratch, n, SND_RATE);
+            n = bakeEngine(scratch);
+            CremaSoundCreateLooping(&sndEngine, scratch, n, SND_RATE, 0);
+            free(scratch);
+        }
+    }
+    // The engine is a voice we own: it never ends, so nothing can reclaim it.
+    CremaAudioVoice *engineVoice = CremaAudioHold(&sndEngine, 0.30f, 1.0f);
+
     uint32_t score = 0, collisions = 0;
 
     Flight flight;
@@ -620,6 +651,16 @@ int main(int argc, char **argv)
 
         CremaInputPoll(&input);
         flightUpdate(&flight, &input, dt);
+
+        // The engine note rides the throttle: one 0.2 s loop, resampled. This
+        // is the whole trick a sampler is capable of — the sound never changes,
+        // only the rate it is read at, and that is a working synthesiser.
+        CremaAudioUpdate();
+        {
+            float rpm = (flight.speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN);
+            CremaAudioVoiceSet(engineVoice, 0.26f + rpm * 0.22f,
+                               0.80f + rpm * 0.70f);
+        }
 
         // model matrix: yaw, then pitch, then roll, at the ship's position
         Mat4 model = mat4_mul(mat4_translate(flight.pos.x, flight.pos.y, flight.pos.z),
@@ -679,6 +720,10 @@ int main(int argc, char **argv)
             }
             // A shot you cannot see is a shot the player will not believe:
             // muzzle flash, a line of tracer beads, and a bloom where it lands
+            // A little pitch scatter, so ten shots in a row are not one shot
+            // played ten times — the cheapest anti-repetition trick there is.
+            CremaAudioPlay(&sndLaser, 0.80f, 0.92f + nextRandom(&rng) * 0.16f);
+
             float reach = best ? bestDist : 320.0f;
             Vec3 muzzle = { flight.pos.x + fwd.x * 5.0f,
                             flight.pos.y + fwd.y * 5.0f,
@@ -695,6 +740,11 @@ int main(int argc, char **argv)
             }
 
             if (best) {
+                // Distance is the cheapest mixing there is: the same explosion,
+                // quieter and a shade lower when it goes off far away.
+                float loud = 1.0f / (1.0f + bestDist / 240.0f);
+                CremaAudioPlay(&sndBoom, loud, 0.90f + loud * 0.20f);
+
                 Vec3 at = best->pos;
                 CremaEffectSpawn(&fx, at, 0.45f, 3.0f, 34.0f,
                                  1.0f, 0.5f, 0.14f, 1.0f);
@@ -720,6 +770,8 @@ int main(int argc, char **argv)
             if (!e->active)
                 continue;
             if (CremaSphereHitsSphere(flight.pos, shipRadius, e->pos, e->radius)) {
+                // pitched down: a hit on you should sound heavier than a kill
+                CremaAudioPlay(&sndBoom, 1.0f, 0.72f);
                 CremaEffectSpawn(&fx, e->pos, 0.6f, 4.0f, 44.0f,
                                  1.0f, 0.42f, 0.12f, 1.0f);
                 CremaEntityDespawn(&enemies, e);
@@ -809,11 +861,18 @@ int main(int argc, char **argv)
         CremaFrameEnd(&frame, &stats);
 
         if (stats.updated)
-            WHBLogPrintf("[flight] %.1f fps | speed %.0f | alt %.0f | sync %.2f ms",
-                         stats.fps, flight.speed, flight.pos.y, stats.drainMs);
+            WHBLogPrintf("[flight] %.1f fps | speed %.0f | alt %.0f | sync %.2f ms"
+                         " | voices %u",
+                         stats.fps, flight.speed, flight.pos.y, stats.drainMs,
+                         (unsigned)CremaAudioVoicesInUse());
     }
 
     CremaFrameSettle(&frame);
+    CremaAudioRelease(engineVoice);
+    CremaSoundDestroy(&sndEngine);
+    CremaSoundDestroy(&sndBoom);
+    CremaSoundDestroy(&sndLaser);
+    CremaAudioShutdown();
     CremaUniformRingDestroy(&fxRing);
     CremaUniformRingDestroy(&enemyRing);
     CremaUniformRingDestroy(&globals);

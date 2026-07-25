@@ -37,6 +37,13 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 - **crema_collide** — bounding spheres from the AABB the baker put in the mesh,
   sphere/sphere and ray/sphere. Spheres because an AABB stops bounding anything
   the moment the object rotates
+- **crema_audio** — sound through AX, which is not a file player but a hardware
+  sampler: a `CremaSound` is PCM in DSP-visible memory (cache-flushed, because
+  the DSP reads memory the CPU still holds dirty — lesson 3 with a different
+  chip), and a voice is that buffer played at a pitch. One-shots are fired and
+  forgotten, reclaimed when they end; a held voice you own and retune every
+  frame. Init it *first*: until a title takes AX over, the system keeps playing
+  the transition audio it was handed — which is the Wii U Menu's music
 - **crema_matrix** — column-major mat4/vec3 math, GL conventions
 
 Nothing here was designed in advance. Every module was extracted from an
@@ -70,7 +77,7 @@ while (CremaAppRunning()) {
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 36 ms |
-| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot | 60 fps, CPU idle |
+| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, and an engine note that rides the throttle | 60 fps, CPU idle |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -108,6 +115,24 @@ part sitting off-centre. Ours caught seven inside-out solids on the first run.)
 Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
 read from `/vol/content/` — confirmed working on real hardware under Aroma, not
 just in Cemu.
+
+### The same waveform on both machines
+
+PoC 11's sounds are generated in plain C in
+[`sounds.h`](examples/poc11-flight/sounds.h) — a file with no console header in
+it. That is not tidiness: it means `tools/render_sounds.c` can compile *the same
+source* on a PC and write WAVs, so the offline preview is the sound, not a
+model of it.
+
+```sh
+cc -O2 -o render_sounds tools/render_sounds.c -lm && ./render_sounds out/
+```
+
+It reports what an ear cannot: the explosion was clipping 550 samples flat on
+its attack (fixed with a `tanh` saturation — an explosion should be squashed,
+but by a curve, not a ceiling), and the engine loop's wrap-around step is 359
+against a largest in-loop step of 423, so the loop closes without the tick you
+would otherwise hear five times a second and blame on the DSP.
 
 ### What loading actually costs (measured on console)
 

@@ -17,14 +17,19 @@ stop.
 
     python tools/chiproll_import.py session.json out.csong
 
-Two things the format does not say and this has to decide:
+Two rules that are not in the file but are in the format, confirmed by its
+author:
 
-  - a step is a sixteenth note (--steps-per-beat changes it). chiproll gives a
+  - **an empty step is a rest, not a held note.** This is chiproll's convention
+    on purpose, taken from DAW piano rolls and against the tracker habit:
+    FamiTracker makes you write the rest, and leaving the cell blank sustains
+    what came before. Here blank means silence. (Held notes exist in chiproll
+    and are expressed some other way; when a session using them turns up, this
+    is where the handling goes.)
+  - a step is a sixteenth note by default (--steps-per-beat). chiproll gives a
     BPM and a step count and leaves the subdivision to the reader.
-  - a step with no note is a rest, not a held note. There is one null for both
-    meanings, and the sessions read as step sequences: repeated notes with gaps
-    between them rather than one long note. --gate changes how much of its step
-    a note holds.
+
+--gate sets how much of its step a note holds before the note-off.
 """
 
 import json

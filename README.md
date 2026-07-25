@@ -231,11 +231,20 @@ chain had to change.
 In the imported test session, 23 of its 25 pitched notes are somewhere other
 than where equal temperament would put them.
 
-The two things chiproll's format leaves to the reader, and what the importer
-assumes: a step is a sixteenth (`--steps-per-beat`), and a step with no note is
-a rest rather than a held one — there is a single `null` for both meanings, and
-the sessions read as step sequences (`--gate` sets how much of its step a note
-holds).
+**How far out depends on how high you are**, which is the part worth knowing.
+The divider is an integer, so its steps get coarser as the pitch rises: around
+E6 two adjacent register values are ~20 cents apart, and landing 3.3 cents from
+the right note is nearly luck. Down at A2 on the triangle they are ~3.4 cents
+apart and the chip is almost in tune by construction. The session above shows
+exactly that — its top notes are 3–4 cents out, its bottom ones 0.06 and 0.4.
+Which also means you will not *hear* it on staccato single notes, since a few
+cents is under most listeners' threshold; it shows up when two channels hold
+the same note or the octave and start to beat.
+
+One rule of chiproll's format worth writing down, because it is a deliberate
+choice and not an accident: **an empty step is a rest, not a held note.** That
+is the DAW piano-roll convention, and the opposite of FamiTracker, where a
+blank cell sustains and rests have to be written.
 
 ### The sequencer runs on AX's clock, not on yours
 

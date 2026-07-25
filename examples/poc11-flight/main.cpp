@@ -40,13 +40,14 @@
 #include "crema_entity.h"
 #include "crema_frame.h"
 #include "crema_input.h"
+#include "crema_bank.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
+#include "crema_music.h"
 #include "crema_pak.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
 #include "hud.h"        // the readout: quads in screen space, no console either
-#include "sounds.h"     // the waveforms: plain C, no console in them at all
 
 #define NUM_WINGMEN 4
 #define NUM_SHIPS   (1 + NUM_WINGMEN)
@@ -697,21 +698,38 @@ int main(int argc, char **argv)
     // takes the answer and gets on with being a game.
     CremaMesh ship;
     GX2Texture hull, font;
+    CremaBank bank;
+    memset(&bank, 0, sizeof(bank));
+    CremaMusic *music = NULL;
     bool assetsOk = false;
     {
         CremaPak pak;
         if (CremaPakOpen(&pak, "/vol/content/assets.cpak")) {
-            size_t meshBytes = 0, hullBytes = 0, fontBytes = 0;
+            size_t meshBytes = 0, hullBytes = 0, fontBytes = 0, bankBytes = 0;
             const void *meshBlob = CremaPakFind(&pak, "ship.cmesh", &meshBytes);
             const void *hullBlob = CremaPakFind(&pak, "hull.ctex", &hullBytes);
             const void *fontBlob = CremaPakFind(&pak, "font.ctex", &fontBytes);
-            assetsOk = meshBlob && hullBlob && fontBlob &&
+            const void *bankBlob = CremaPakFind(&pak, "audio.cbank", &bankBytes);
+            size_t songBytes = 0;
+            const void *songBlob = CremaPakFind(&pak, "theme.csong", &songBytes);
+            assetsOk = meshBlob && hullBlob && fontBlob && bankBlob &&
                 CremaMeshLoadFromMemory(&ship, meshBlob, meshBytes, "ship.cmesh") &&
                 CremaTextureLoadFromMemory(&hull, hullBlob, hullBytes, "hull.ctex") &&
-                CremaTextureLoadFromMemory(&font, fontBlob, fontBytes, "font.ctex");
-            CremaPakClose(&pak);   // the GPU has its copies now
+                CremaTextureLoadFromMemory(&font, fontBlob, fontBytes, "font.ctex") &&
+                CremaBankLoadFromMemory(&bank, bankBlob, bankBytes);
+            if (assetsOk && songBlob)
+                CremaMusicLoadFromMemory(&music, songBlob, songBytes, &bank);
+            // Everything has its own copy now — the GPU for the two textures
+            // and the mesh, the bank for its samples, because the DSP will
+            // still be reading those while the ship flies.
+            CremaPakClose(&pak);
         }
     }
+    const CremaInstrument *sndLaser  = CremaBankFind(&bank, "laser");
+    const CremaInstrument *sndBoom   = CremaBankFind(&bank, "boom");
+    const CremaInstrument *sndEngine = CremaBankFind(&bank, "engine");
+    if (!sndLaser || !sndBoom || !sndEngine)
+        assetsOk = false;
     if (!assetsOk) {
         WHBLogPrintf("[flight] asset load failed");
         CremaShaderShutdownCompiler();
@@ -851,29 +869,9 @@ int main(int argc, char **argv)
     CremaUniformRingCreate(&hudRingTv, HUD_BYTES, CREMA_FRAMES_IN_FLIGHT);
     CremaUniformRingCreate(&hudRingDrc, HUD_BYTES, CREMA_FRAMES_IN_FLIGHT);
 
-    // --- the sounds, cooked once into DSP memory --------------------------
-    // One scratch buffer, three sounds, ~85 KB of PCM. Baking them here costs a
-    // few milliseconds at startup; the alternative is a synthesiser running
-    // every frame for sounds that never change.
-    CremaSound sndLaser, sndBoom, sndEngine;
-    memset(&sndLaser, 0, sizeof(sndLaser));
-    memset(&sndBoom,  0, sizeof(sndBoom));
-    memset(&sndEngine, 0, sizeof(sndEngine));
-    {
-        int16_t *scratch = (int16_t *)malloc(SND_MAX_SAMPS * sizeof(int16_t));
-        if (scratch) {
-            uint32_t n;
-            n = bakeLaser(scratch);
-            CremaSoundCreate(&sndLaser, scratch, n, SND_RATE);
-            n = bakeBoom(scratch);
-            CremaSoundCreate(&sndBoom, scratch, n, SND_RATE);
-            n = bakeEngine(scratch);
-            CremaSoundCreateLooping(&sndEngine, scratch, n, SND_RATE, 0);
-            free(scratch);
-        }
-    }
     // The engine is a voice we own: it never ends, so nothing can reclaim it.
-    CremaAudioVoice *engineVoice = CremaAudioHold(&sndEngine, 0.30f, 1.0f);
+    CremaAudioVoice *engineVoice = sndEngine
+        ? CremaAudioHold(&sndEngine->sound, 0.30f, 1.0f) : NULL;
 
     uint32_t score = 0, collisions = 0;
 
@@ -915,6 +913,11 @@ int main(int argc, char **argv)
 
     static const float SKY[4] = { 0.50f, 0.62f, 0.74f, 1.0f };
     static const float TACTICAL[4] = { 0.02f, 0.05f, 0.08f, 1.0f };
+
+    // The song starts here, not at load: the callback ticks against the DSP
+    // from this moment and nothing about the frame loop can hurry or delay it.
+    if (music)
+        CremaMusicStart(music);
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
@@ -1017,7 +1020,7 @@ int main(int argc, char **argv)
             // muzzle flash, a line of tracer beads, and a bloom where it lands
             // A little pitch scatter, so ten shots in a row are not one shot
             // played ten times — the cheapest anti-repetition trick there is.
-            CremaAudioPlay(&sndLaser, 0.80f, 0.92f + nextRandom(&rng) * 0.16f);
+            CremaAudioPlay(&sndLaser->sound, 0.80f, 0.92f + nextRandom(&rng) * 0.16f);
 
             Vec3 muzzle = { flight.pos.x + fwd.x * 5.0f,
                             flight.pos.y + fwd.y * 5.0f,
@@ -1037,7 +1040,7 @@ int main(int argc, char **argv)
                 // Distance is the cheapest mixing there is: the same explosion,
                 // quieter and a shade lower when it goes off far away.
                 float loud = 1.0f / (1.0f + bestDist / 240.0f);
-                CremaAudioPlay(&sndBoom, loud, 0.90f + loud * 0.20f);
+                CremaAudioPlay(&sndBoom->sound, loud, 0.90f + loud * 0.20f);
 
                 Vec3 at = best->pos;
                 CremaEffectSpawn(&fx, at, 0.45f, 3.0f, 34.0f,
@@ -1066,7 +1069,7 @@ int main(int argc, char **argv)
                 continue;
             if (CremaSphereHitsSphere(flight.pos, shipRadius, e->pos, e->radius)) {
                 // pitched down: a hit on you should sound heavier than a kill
-                CremaAudioPlay(&sndBoom, 1.0f, 0.72f);
+                CremaAudioPlay(&sndBoom->sound, 1.0f, 0.72f);
                 CremaEffectSpawn(&fx, e->pos, 0.6f, 4.0f, 44.0f,
                                  1.0f, 0.42f, 0.12f, 1.0f);
                 if (e == best)
@@ -1184,18 +1187,23 @@ int main(int argc, char **argv)
 
         CremaFrameEnd(&frame, &stats);
 
-        if (stats.updated)
+        if (stats.updated) {
+            CremaMusicStats ms;
+            memset(&ms, 0, sizeof(ms));
+            CremaMusicGetStats(music, &ms);
             WHBLogPrintf("[flight] %.1f fps | speed %.0f | alt %.0f | sync %.2f ms"
-                         " | voices %u",
+                         " | voices %u | seq %u us last, %u us worst, %u ticks,"
+                         " %u notes, %u loops",
                          stats.fps, flight.speed, flight.pos.y, stats.drainMs,
-                         (unsigned)CremaAudioVoicesInUse());
+                         (unsigned)CremaAudioVoicesInUse(),
+                         ms.lastUs, ms.maxUs, ms.ticks, ms.notesOn, ms.loops);
+        }
     }
 
     CremaFrameSettle(&frame);
     CremaAudioRelease(engineVoice);
-    CremaSoundDestroy(&sndEngine);
-    CremaSoundDestroy(&sndBoom);
-    CremaSoundDestroy(&sndLaser);
+    CremaMusicClose(music);
+    CremaBankClose(&bank);
     CremaAudioShutdown();
     CremaUniformRingDestroy(&hudRingDrc);
     CremaUniformRingDestroy(&hudRingTv);

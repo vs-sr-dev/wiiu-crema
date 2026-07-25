@@ -8,6 +8,7 @@
 #   python tools/crema_bake.py mesh    in.obj  out.cmesh
 #   python tools/crema_bake.py texture in.png  out.ctex
 #   python tools/crema_bake.py pak     out.cpak  a.cmesh b.ctex ...
+#   python tools/crema_bake.py bank    out.cbank audio/bank.json
 #
 # Everything is written BIG-ENDIAN on purpose: the Wii U CPU is big-endian and
 # the GX2 fetch shader swaps attribute words for the GPU, so a baked file can
@@ -36,6 +37,7 @@
 #   32  entryCount x { name[32], offset, size }                     = 40 each
 #       payloads, each 64-byte aligned, offsets counted from the start of file
 
+import json
 import os
 import struct
 import sys
@@ -297,6 +299,92 @@ def bake_texture(src, dst, mips=True):
           % (dst, w, h, len(levels), os.path.getsize(dst)))
 
 
+# .cbank layout — an instrument is a sample plus the two numbers a WAV cannot
+# carry: where the loop starts, and how long one cycle is. That second number is
+# what makes it an instrument rather than a noise: a voice playing a cycle of
+# `cycleSamples` at rate R sounds at R/cycleSamples Hz, so a note is a playback
+# rate and nothing else. Zero means "not pitched" — drive the rate yourself.
+#    0  magic 'CBNK' | 4 version | 8 count | 12 rate | 16 reserved[4]  = 32
+#   32  count x { name[24], offset, sampleCount, loopStart, cycleSamples,
+#                flags }                                               = 44
+#       PCM16 payloads, 64-byte aligned, offsets from the start of file
+BANK_HEADER_SIZE = 32
+BANK_ENTRY_SIZE = 44
+BANK_FLAG_LOOPING = 1
+
+
+def read_wav_mono16(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise SystemExit("%s: not a RIFF/WAVE file" % path)
+    pos, fmt, pcm = 12, None, None
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = struct.unpack("<HHIIHH", body[:16])
+        elif cid == b"data":
+            pcm = body
+        pos += 8 + size + (size & 1)
+    if not fmt or pcm is None:
+        raise SystemExit("%s: missing fmt or data chunk" % path)
+    tag, channels, rate, _, _, bits = fmt
+    if tag != 1 or channels != 1 or bits != 16:
+        raise SystemExit("%s: need 16-bit mono PCM, got %d-bit %d-channel "
+                         "format %d" % (path, bits, channels, tag))
+    return pcm, rate
+
+
+def bake_bank(dst, manifest_path):
+    with open(manifest_path) as fh:
+        manifest = json.load(fh)
+    root = os.path.dirname(os.path.abspath(manifest_path))
+    rate = manifest.get("rate", 32000)
+
+    entries = []
+    offset = BANK_HEADER_SIZE + BANK_ENTRY_SIZE * len(manifest["instruments"])
+    offset = (offset + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
+    for inst in manifest["instruments"]:
+        pcm, wavRate = read_wav_mono16(os.path.join(root, inst["file"]))
+        if wavRate != rate:
+            raise SystemExit("%s: %d Hz, but the bank is %d Hz — resample it "
+                             "or the pitch will be a lie"
+                             % (inst["file"], wavRate, rate))
+        name = inst["name"].encode("ascii")
+        if len(name) > 23:
+            raise SystemExit("%s: name longer than 23 characters" % inst["name"])
+        # The samples are written big-endian: the console reads them as they
+        # are, and an AX voice is handed the file's own bytes.
+        swapped = b"".join(struct.pack(">h", v) for (v,) in
+                           struct.iter_unpack("<h", pcm))
+        entries.append((name, offset, swapped, inst))
+        offset += (len(swapped) + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
+
+    total = offset
+    with open(dst, "wb") as fh:
+        fh.write(struct.pack(">4s3I4I", b"CBNK", VERSION, len(entries), rate,
+                             0, 0, 0, 0))
+        for name, off, pcm, inst in entries:
+            flags = BANK_FLAG_LOOPING if inst.get("loop") else 0
+            fh.write(struct.pack(">24sIIIII", name, off, len(pcm) // 2,
+                                 inst.get("loopStart", 0),
+                                 inst.get("cycleSamples", 0), flags))
+        for name, off, pcm, inst in entries:
+            fh.write(b"\0" * (off - fh.tell()))
+            fh.write(pcm)
+        fh.write(b"\0" * (total - fh.tell()))
+
+    for name, off, pcm, inst in entries:
+        print("    %-10s %7d samples%s%s" % (
+            name.decode(), len(pcm) // 2,
+            "  loop@%d" % inst.get("loopStart", 0) if inst.get("loop") else "",
+            "  cycle %d" % inst["cycleSamples"] if inst.get("cycleSamples") else ""))
+    print("  %s: %d instruments, %d Hz, %d bytes"
+          % (dst, len(entries), rate, total))
+
+
 PAK_HEADER_SIZE = 32
 PAK_ENTRY_SIZE = 40
 PAK_ALIGN = 64
@@ -340,8 +428,9 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = set(a for a in sys.argv[1:] if a.startswith("--"))
     usage = ("usage: crema_bake.py {mesh|texture} <input> <output> [--no-mips]\n"
-             "       crema_bake.py pak <output.cpak> <input> [<input> ...]")
-    if len(args) < 3 or args[0] not in ("mesh", "texture", "pak"):
+             "       crema_bake.py pak <output.cpak> <input> [<input> ...]\n"
+             "       crema_bake.py bank <output.cbank> <bank.json>")
+    if len(args) < 3 or args[0] not in ("mesh", "texture", "pak", "bank"):
         print(__doc__ or "")
         print(usage)
         raise SystemExit(2)
@@ -357,6 +446,12 @@ def main():
     if len(args) != 3:
         print(usage)
         raise SystemExit(2)
+    if kind == "bank":
+        dst, src = args[1], args[2]
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+        print("baking bank: %s" % src)
+        bake_bank(dst, src)
+        return
     src, dst = args[1], args[2]
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     print("baking %s: %s" % (kind, src))

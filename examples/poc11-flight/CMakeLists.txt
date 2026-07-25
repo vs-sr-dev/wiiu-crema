@@ -12,10 +12,14 @@ set(POC11_CONTENT "${CMAKE_CURRENT_BINARY_DIR}/bundle")
 # emptied first: the bundle is generated, and a file left behind by a previous
 # configure would be shipped forever without ever appearing in this list
 file(REMOVE_RECURSE "${POC11_CONTENT}")
+crema_bake(bank "${CMAKE_CURRENT_BINARY_DIR}/audio.cbank"
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio/bank.json")
 crema_pak("${POC11_CONTENT}/assets.cpak"
           "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/ship.cmesh"
           "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/hull.ctex"
-          "${CMAKE_CURRENT_SOURCE_DIR}/content/font.ctex")
+          "${CMAKE_CURRENT_SOURCE_DIR}/content/font.ctex"
+          "${CMAKE_CURRENT_BINARY_DIR}/audio.cbank"
+          "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio/theme.csong")
 
 wut_create_wuhb(poc11_flight
     NAME      "GX2 PoC11 - Flight"

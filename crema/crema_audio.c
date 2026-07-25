@@ -171,15 +171,19 @@ static float pitchToRatio(uint32_t rate, float pitch)
     float ratio = ((float)rate / (float)s_mixRate) * pitch;
     // The resampler will not follow you anywhere: a ratio of zero stops the
     // voice dead and a huge one races through the buffer in a single frame.
-    if (ratio < 0.05f) ratio = 0.05f;
+    // The floor is low on purpose — a 32-sample cycle asked for a bass A1 sits
+    // at 0.055, so anything stricter would quietly transpose the bottom two
+    // octaves of every instrument.
+    if (ratio < 0.01f) ratio = 0.01f;
     if (ratio > 4.0f)  ratio = 4.0f;
     return ratio;
 }
 
-static struct CremaAudioVoice *startVoice(const CremaSound *snd, float volume,
-                                          float pitch, bool held)
+// Take a voice and give it everything that does not depend on which sound it
+// will play: type, device mix, a silent envelope. It comes back stopped.
+static struct CremaAudioVoice *acquireSlot(bool held)
 {
-    if (!s_ready || !snd || !snd->samples || snd->count == 0)
+    if (!s_ready)
         return NULL;
 
     struct CremaAudioVoice *slot = NULL;
@@ -200,7 +204,7 @@ static struct CremaAudioVoice *startVoice(const CremaSound *snd, float volume,
     slot->ax    = v;
     slot->inUse = true;
     slot->held  = held;
-    slot->rate  = snd->rate;
+    slot->rate  = 0;
 
     // Everything between Begin and End is one atomic change as far as the DSP
     // is concerned: without it a voice can start playing half-configured.
@@ -209,7 +213,7 @@ static struct CremaAudioVoice *startVoice(const CremaSound *snd, float volume,
     AXSetVoiceType(v, 0);
 
     AXVoiceVeData ve;
-    ve.volume = volumeToFixed(volume);
+    ve.volume = 0;
     ve.delta  = 0;
     AXSetVoiceVe(v, &ve);
 
@@ -222,6 +226,29 @@ static struct CremaAudioVoice *startVoice(const CremaSound *snd, float volume,
     mix[1].bus[0].volume = AX_UNITY_VOLUME;
     AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_TV,  0, mix);
     AXSetVoiceDeviceMix(v, AX_DEVICE_TYPE_DRC, 0, mix);
+
+    AXSetVoiceSrcType(v, AX_VOICE_SRC_TYPE_LINEAR);
+    AXVoiceEnd(v);
+    return slot;
+}
+
+// Aim a voice at a sound and start it from the top. Everything here is a write
+// to voice state — no acquisition, no allocation — which is what makes it safe
+// to call from the audio thread.
+static void applySound(struct CremaAudioVoice *slot, const CremaSound *snd,
+                       float volume, float pitch)
+{
+    AXVoice *v = slot ? slot->ax : NULL;
+    if (!v || !snd || !snd->samples || snd->count == 0)
+        return;
+    slot->rate = snd->rate;
+
+    AXVoiceBegin(v);
+
+    AXVoiceVeData ve;
+    ve.volume = volumeToFixed(volume);
+    ve.delta  = 0;
+    AXSetVoiceVe(v, &ve);
 
     // A recycled voice still holds the last one's resampler state: zero it, or
     // the first sample of a new sound is a click left over from the old one.
@@ -246,17 +273,45 @@ static struct CremaAudioVoice *startVoice(const CremaSound *snd, float volume,
 
     AXSetVoiceState(v, AX_VOICE_STATE_PLAYING);
     AXVoiceEnd(v);
-    return slot;
 }
 
 bool CremaAudioPlay(const CremaSound *snd, float volume, float pitch)
 {
-    return startVoice(snd, volume, pitch, false) != NULL;
+    if (!snd || !snd->samples)
+        return false;
+    struct CremaAudioVoice *slot = acquireSlot(false);
+    if (!slot)
+        return false;
+    applySound(slot, snd, volume, pitch);
+    return true;
 }
 
 CremaAudioVoice *CremaAudioHold(const CremaSound *snd, float volume, float pitch)
 {
-    return startVoice(snd, volume, pitch, true);
+    if (!snd || !snd->samples)
+        return NULL;
+    struct CremaAudioVoice *slot = acquireSlot(true);
+    if (slot)
+        applySound(slot, snd, volume, pitch);
+    return slot;
+}
+
+CremaAudioVoice *CremaAudioReserve(void)
+{
+    return acquireSlot(true);
+}
+
+void CremaAudioVoiceRetrigger(CremaAudioVoice *voice, const CremaSound *snd,
+                              float volume, float pitch)
+{
+    if (voice && voice->inUse)
+        applySound(voice, snd, volume, pitch);
+}
+
+void CremaAudioVoiceSilence(CremaAudioVoice *voice)
+{
+    if (voice && voice->inUse && voice->ax)
+        AXSetVoiceState(voice->ax, AX_VOICE_STATE_STOPPED);
 }
 
 void CremaAudioVoiceSet(CremaAudioVoice *voice, float volume, float pitch)

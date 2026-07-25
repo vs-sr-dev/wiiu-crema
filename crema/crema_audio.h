@@ -76,6 +76,23 @@ CremaAudioVoice *CremaAudioHold(const CremaSound *snd, float volume, float pitch
 void CremaAudioVoiceSet(CremaAudioVoice *voice, float volume, float pitch);
 void CremaAudioRelease(CremaAudioVoice *voice);
 
+// A held voice with nothing in it yet — for a caller that will aim it later.
+//
+// This exists for the sequencer, and the reason is the oldest rule in real-time
+// audio: **never allocate on the audio thread.** A music channel reserves its
+// voice once, on the game thread, and from then on a note-on is not an
+// acquisition but a re-aiming — new samples, new pitch, play from the top.
+// Nothing is taken or given back while the song runs, so nothing on the audio
+// side ever has to agree with the game side about who owns what.
+CremaAudioVoice *CremaAudioReserve(void);
+
+// Point a voice at a sound and (re)start it from the beginning.
+void CremaAudioVoiceRetrigger(CremaAudioVoice *voice, const CremaSound *snd,
+                              float volume, float pitch);
+
+// Note off: stop it, but keep the voice — the channel still owns it.
+void CremaAudioVoiceSilence(CremaAudioVoice *voice);
+
 // Once per frame: hands back the voices whose one-shots have finished. Without
 // it the pool fills up after a few dozen shots and the game goes quiet.
 void CremaAudioUpdate(void);

@@ -1,0 +1,68 @@
+{
+  "rate": 32000,
+  "instruments": [
+    {
+      "name": "pulse12",
+      "file": "pulse12.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32
+    },
+    {
+      "name": "pulse25",
+      "file": "pulse25.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32
+    },
+    {
+      "name": "pulse50",
+      "file": "pulse50.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32
+    },
+    {
+      "name": "triangle",
+      "file": "triangle.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32
+    },
+    {
+      "name": "saw",
+      "file": "saw.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32
+    },
+    {
+      "name": "noise",
+      "file": "noise.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "laser",
+      "file": "laser.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "boom",
+      "file": "boom.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "engine",
+      "file": "engine.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 0
+    }
+  ]
+}

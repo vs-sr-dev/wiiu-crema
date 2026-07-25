@@ -30,7 +30,9 @@
 #include <string.h>
 
 #include "crema_app.h"
+#include "crema_blend.h"
 #include "crema_buffer.h"
+#include "crema_effect.h"
 #include "crema_collide.h"
 #include "crema_entity.h"
 #include "crema_frame.h"
@@ -58,6 +60,8 @@
     "    vec4 uFogColor;\n" \
     "    vec4 uTime;\n"     \
     "    vec4 uGroundOffset;\n" \
+    "    vec4 uCamRight;\n" \
+    "    vec4 uCamUp;\n"    \
     "};\n"
 
 static const char *VS_SHIP =
@@ -136,6 +140,43 @@ static const char *VS_ENEMY =
     "    vWorld = world;\n"
     "}\n";
 
+// Billboards: a quad spun to face the camera using the camera's own right and
+// up axes. One draw covers tracers, muzzle flashes and explosions — they only
+// differ by colour, size and how long they live.
+static const char *VS_FX =
+    "#version 450\n"
+    "layout(location = 0) in vec2 aCorner;\n"   // -1..1 square
+    GLOBAL_UBO_DECL
+    "layout(binding = 1) uniform Effects {\n"
+    "    vec4 uFx[128];\n"   // 64 x { xyz = position, w = size }, { rgb, alpha }
+    "};\n"
+    "layout(location = 0) out vec2 vCorner;\n"
+    "layout(location = 1) out vec4 vTint;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 ps  = uFx[gl_InstanceID * 2];\n"
+    "    vec4 col = uFx[gl_InstanceID * 2 + 1];\n"
+    "    vec3 world = ps.xyz + uCamRight.xyz * (aCorner.x * ps.w)\n"
+    "                        + uCamUp.xyz    * (aCorner.y * ps.w);\n"
+    "    gl_Position = uViewProj * vec4(world, 1.0);\n"
+    "    vCorner = aCorner;\n"
+    "    vTint = col;\n"
+    "}\n";
+
+static const char *PS_FX =
+    "#version 450\n"
+    "layout(location = 0) in vec2 vCorner;\n"
+    "layout(location = 1) in vec4 vTint;\n"
+    "layout(location = 0) out vec4 oColor;\n"
+    "void main()\n"
+    "{\n"
+    // a soft round blob computed from the corner coordinate: no sprite sheet,
+    // no texture fetch, and it never shows its square edges
+    "    float d = length(vCorner);\n"
+    "    float falloff = 1.0 - smoothstep(0.15, 1.0, d);\n"
+    "    oColor = vec4(vTint.rgb * falloff, vTint.a * falloff);\n"
+    "}\n";
+
 static const char *VS_GROUND =
     "#version 450\n"
     "layout(location = 0) in vec3 aPosition;\n"
@@ -180,7 +221,17 @@ typedef struct {
     float fogColor[4];
     float time[4];
     float groundOffset[4];
+    float camRight[4];
+    float camUp[4];
 } GlobalBlock;
+
+// --- billboard quad -----------------------------------------------------------
+
+#define MAX_EFFECTS 64
+static const float FX_VERTS[] = { -1.0f, -1.0f,  1.0f, -1.0f,
+                                   1.0f,  1.0f, -1.0f,  1.0f };
+static const uint16_t FX_TRIS[] = { 0, 1, 2, 0, 2, 3 };
+#define FX_STRIDE (2 * sizeof(float))
 
 // --- ground ------------------------------------------------------------------
 
@@ -233,13 +284,20 @@ typedef struct {
     const void *enemyUbo;
     size_t   enemyBytes;
     uint32_t enemyCount;
+    const CremaShader *shFx;
+    GX2RBuffer *fxVbo, *fxIbo;
+    int32_t  gVsFx, fxLoc;
+    const void *fxUbo;
+    size_t   fxBytes;
+    uint32_t fxCount;
 } SceneView;
 
 static void drawScene(void *user)
 {
     const SceneView *s = (const SceneView *)user;
 
-    GX2SetDepthOnlyControl(TRUE, TRUE, GX2_COMPARE_FUNC_LESS);
+    CremaDepthSet(true, true);
+    CremaBlendSet(CREMA_BLEND_OPAQUE);
     GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, TRUE);
 
     CremaShaderBind(s->shGround);
@@ -267,6 +325,25 @@ static void drawScene(void *user)
         GX2SetPixelTexture(s->hull, s->enemyUnit);
         GX2SetPixelSampler(s->sampler, s->enemyUnit);
         CremaMeshDraw(s->ship, s->enemyCount);
+    }
+
+    // Transparent pass, last: additive, depth test on, depth writes OFF so
+    // overlapping billboards do not carve holes in each other. Culling off
+    // too — a camera-facing quad has no reliable winding.
+    if (s->fxCount > 0) {
+        CremaBlendSet(CREMA_BLEND_ADDITIVE);
+        CremaDepthSet(true, false);
+        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
+
+        CremaShaderBind(s->shFx);
+        GX2SetVertexUniformBlock(s->gVsFx, sizeof(GlobalBlock), s->globalUbo);
+        GX2SetVertexUniformBlock(s->fxLoc, s->fxBytes, s->fxUbo);
+        GX2RSetAttributeBuffer(s->fxVbo, 0, FX_STRIDE, 0);
+        GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->fxIbo,
+                        GX2_INDEX_TYPE_U16, 6, 0, 0, s->fxCount);
+
+        CremaBlendSet(CREMA_BLEND_OPAQUE);
+        CremaDepthSet(true, true);
     }
 }
 
@@ -389,15 +466,21 @@ int main(int argc, char **argv)
     // individually instead of riding the player's transform
     CremaShader *shEnemy = CremaShaderCompile(VS_ENEMY, PS_SHIP,
                                               ship.attribs, ship.attribCount);
-    if (!shShip || !shGround || !shEnemy) {
+    const CremaAttrib fxAttribs[] = {
+        { 0, 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32 },
+    };
+    CremaShader *shFx = CremaShaderCompile(VS_FX, PS_FX, fxAttribs, 1);
+    if (!shShip || !shGround || !shEnemy || !shFx) {
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;
     }
 
-    GX2RBuffer groundVbo, groundIbo;
+    GX2RBuffer groundVbo, groundIbo, fxVbo, fxIbo;
     CremaBufferCreateVertex(&groundVbo, GROUND_STRIDE, 4, GROUND_VERTS);
     CremaBufferCreateIndexU16(&groundIbo, 6, GROUND_TRIS);
+    CremaBufferCreateVertex(&fxVbo, FX_STRIDE, 4, FX_VERTS);
+    CremaBufferCreateIndexU16(&fxIbo, 6, FX_TRIS);
 
     GX2Texture ground;
     CremaTextureCreate(&ground, GROUND_TEX, GROUND_TEX,
@@ -427,6 +510,10 @@ int main(int argc, char **argv)
     if (gVsEnemy < 0) gVsEnemy = 0;
     if (gPsEnemy < 0) gPsEnemy = 0;
     if (enemyLoc < 0) enemyLoc = 1;
+    int32_t gVsFx = CremaShaderVSBlockLocation(shFx, "Global");
+    int32_t fxLoc = CremaShaderVSBlockLocation(shFx, "Effects");
+    if (gVsFx < 0) gVsFx = 0;
+    if (fxLoc < 0) fxLoc = 1;
     uint32_t hullUnit = 0, groundUnit = 0, enemyUnit = 0;
     if (shShip->ps->samplerVarCount > 0)
         hullUnit = shShip->ps->samplerVars[0].location;
@@ -472,6 +559,13 @@ int main(int argc, char **argv)
     for (int i = 0; i < ENEMY_COUNT; i++)
         spawnEnemy(&enemies, &rng, shipRadius, startPoint);
 
+    CremaEffect fxStorage[MAX_EFFECTS];
+    CremaEffectPool fx;
+    CremaEffectPoolInit(&fx, fxStorage, MAX_EFFECTS);
+    CremaUniformRing fxRing;
+    CremaUniformRingCreate(&fxRing, sizeof(float) * 4 * 2 * MAX_EFFECTS,
+                           CREMA_FRAMES_IN_FLIGHT);
+
     uint32_t score = 0, collisions = 0;
 
     Flight flight;
@@ -501,6 +595,10 @@ int main(int argc, char **argv)
     view.enemyLoc = enemyLoc;     view.enemyUnit = enemyUnit;
     view.enemyBytes = sizeof(float) * 4 * MAX_ENEMIES;
     view.enemyCount = 0;
+    view.shFx = shFx;             view.fxVbo = &fxVbo;   view.fxIbo = &fxIbo;
+    view.gVsFx = gVsFx;           view.fxLoc = fxLoc;
+    view.fxBytes = sizeof(float) * 4 * 2 * MAX_EFFECTS;
+    view.fxCount = 0;
 
     static const float SKY[4] = { 0.50f, 0.62f, 0.74f, 1.0f };
 
@@ -532,6 +630,17 @@ int main(int argc, char **argv)
         float cp = cosf(flight.pitch), sp = sinf(flight.pitch);
         float cy = cosf(flight.yaw),   sy = sinf(flight.yaw);
         Vec3 fwd = { -sy * cp, sp, -cy * cp };
+
+        // Afterburner: one glow shed behind the ship every frame, brighter the
+        // faster you go. Effects are cheap enough to spend on continuous ones.
+        {
+            Vec3 tail = { flight.pos.x - fwd.x * 3.6f,
+                          flight.pos.y - fwd.y * 3.6f,
+                          flight.pos.z - fwd.z * 3.6f };
+            float heat = (flight.speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN);
+            CremaEffectSpawn(&fx, tail, 0.22f, 1.5f + heat * 2.4f, 0.2f,
+                             0.42f, 0.72f, 1.0f, 0.5f + heat * 0.45f);
+        }
 
         // --- the squadron flies on, wrapping the world at its edges ---
         for (uint32_t i = 0; i < enemies.watermark; i++) {
@@ -568,7 +677,36 @@ int main(int argc, char **argv)
                     bestDist = dist;
                 }
             }
+            // A shot you cannot see is a shot the player will not believe:
+            // muzzle flash, a line of tracer beads, and a bloom where it lands
+            float reach = best ? bestDist : 320.0f;
+            Vec3 muzzle = { flight.pos.x + fwd.x * 5.0f,
+                            flight.pos.y + fwd.y * 5.0f,
+                            flight.pos.z + fwd.z * 5.0f };
+            CremaEffectSpawn(&fx, muzzle, 0.09f, 4.0f, 0.6f,
+                             1.0f, 0.86f, 0.55f, 1.0f);
+            for (int k = 1; k <= 10; k++) {
+                float d = reach * (float)k / 10.0f;
+                Vec3 p = { flight.pos.x + fwd.x * d,
+                           flight.pos.y + fwd.y * d,
+                           flight.pos.z + fwd.z * d };
+                CremaEffectSpawn(&fx, p, 0.13f, 1.7f, 0.25f,
+                                 0.55f, 0.85f, 1.0f, 0.95f);
+            }
+
             if (best) {
+                Vec3 at = best->pos;
+                CremaEffectSpawn(&fx, at, 0.45f, 3.0f, 34.0f,
+                                 1.0f, 0.5f, 0.14f, 1.0f);
+                for (int k = 0; k < 8; k++) {
+                    CremaEffect *sp = CremaEffectSpawn(&fx, at, 0.55f, 2.4f, 0.3f,
+                                                       1.0f, 0.78f, 0.3f, 1.0f);
+                    if (!sp)
+                        break;
+                    sp->velocity.x = (nextRandom(&rng) * 2.0f - 1.0f) * 48.0f;
+                    sp->velocity.y = (nextRandom(&rng) * 2.0f - 1.0f) * 48.0f;
+                    sp->velocity.z = (nextRandom(&rng) * 2.0f - 1.0f) * 48.0f;
+                }
                 CremaEntityDespawn(&enemies, best);
                 spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
                 score++;
@@ -582,6 +720,8 @@ int main(int argc, char **argv)
             if (!e->active)
                 continue;
             if (CremaSphereHitsSphere(flight.pos, shipRadius, e->pos, e->radius)) {
+                CremaEffectSpawn(&fx, e->pos, 0.6f, 4.0f, 44.0f,
+                                 1.0f, 0.42f, 0.12f, 1.0f);
                 CremaEntityDespawn(&enemies, e);
                 spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
                 collisions++;
@@ -607,6 +747,13 @@ int main(int argc, char **argv)
                       flight.pos.z + fwd.z * 22.0f };
         Vec3 up = { 0.0f, 1.0f, 0.0f };
 
+        CremaEffectUpdate(&fx, dt);
+
+        // the billboards need the camera's own axes to face it
+        Vec3 viewFwd   = vec3_normalize(vec3_sub(look, camPos));
+        Vec3 camRight  = vec3_normalize(vec3_cross(viewFwd, up));
+        Vec3 camUpAxis = vec3_cross(camRight, viewFwd);
+
         uint32_t slot = CremaFrameBegin(&frame);
 
         GlobalBlock blk;
@@ -628,6 +775,10 @@ int main(int argc, char **argv)
         blk.groundOffset[1] = 0.0f;
         blk.groundOffset[2] = floorf(flight.pos.z / tile) * tile;
         blk.groundOffset[3] = 0.0f;
+        blk.camRight[0] = camRight.x; blk.camRight[1] = camRight.y;
+        blk.camRight[2] = camRight.z; blk.camRight[3] = 0.0f;
+        blk.camUp[0] = camUpAxis.x;   blk.camUp[1] = camUpAxis.y;
+        blk.camUp[2] = camUpAxis.z;   blk.camUp[3] = 0.0f;
         view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
 
         // pack the live enemies into the instance array, contiguously: the
@@ -648,6 +799,12 @@ int main(int argc, char **argv)
                                               sizeof(enemyData));
         view.enemyCount = live;
 
+        float fxData[MAX_EFFECTS * 2][4];
+        memset(fxData, 0, sizeof(fxData));
+        uint32_t fxLive = CremaEffectPack(&fx, fxData, MAX_EFFECTS);
+        view.fxUbo = CremaUniformRingStore(&fxRing, slot, fxData, sizeof(fxData));
+        view.fxCount = fxLive;
+
         CremaFrameDrawBoth(SKY, drawScene, &view);
         CremaFrameEnd(&frame, &stats);
 
@@ -657,14 +814,18 @@ int main(int argc, char **argv)
     }
 
     CremaFrameSettle(&frame);
+    CremaUniformRingDestroy(&fxRing);
     CremaUniformRingDestroy(&enemyRing);
     CremaUniformRingDestroy(&globals);
     CremaUniformFreeBlock(formation);
+    CremaBufferDestroy(&fxIbo);
+    CremaBufferDestroy(&fxVbo);
     CremaBufferDestroy(&groundIbo);
     CremaBufferDestroy(&groundVbo);
     CremaTextureDestroy(&ground);
     CremaTextureDestroy(&hull);
     CremaMeshDestroy(&ship);
+    CremaShaderFree(shFx);
     CremaShaderFree(shEnemy);
     CremaShaderFree(shGround);
     CremaShaderFree(shShip);

@@ -7,7 +7,9 @@ project(crema C CXX)
 # Sits on top of Espresso and Latte, like any good crema should.
 add_library(crema STATIC
     crema/crema_app.c
+    crema/crema_blend.c
     crema/crema_buffer.c
+    crema/crema_effect.c
     crema/crema_frame.c
     crema/crema_collide.c
     crema/crema_entity.c

@@ -48,6 +48,11 @@ void CremaTextureDestroy(GX2Texture *tex);
 // Bilinear within a level + linear between levels — what a mip chain is for.
 void CremaSamplerInitTrilinear(GX2Sampler *sampler, GX2TexClampMode clampMode);
 
+// Bilinear, no mip filtering: for a texture with a single level, which is
+// what a HUD font atlas is. Ask for mips it does not have and the sampler
+// wanders off the end of the chain.
+void CremaSamplerInitBilinear(GX2Sampler *sampler, GX2TexClampMode clampMode);
+
 #ifdef __cplusplus
 }
 #endif

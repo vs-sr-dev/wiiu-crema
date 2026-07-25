@@ -44,6 +44,7 @@
 #include "crema_mesh.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
+#include "hud.h"        // the readout: quads in screen space, no console either
 #include "sounds.h"     // the waveforms: plain C, no console in them at all
 
 #define NUM_WINGMEN 4
@@ -181,6 +182,66 @@ static const char *PS_FX =
     "    oColor = vec4(vTint.rgb * falloff, vTint.a * falloff);\n"
     "}\n";
 
+// The HUD: one instanced quad per letter, bar and blip. It reads its position
+// in a virtual 1280x720 space and maps that to clip space itself, so the same
+// layout lands identically on the 720p TV and the 854x480 GamePad — the screens
+// differ in resolution, not in where things are.
+static const char *VS_HUD =
+    "#version 450\n"
+    "layout(location = 0) in vec2 aCorner;\n"    // 0..1 square
+    "layout(binding = 0) uniform Hud {\n"
+    "    vec4 uItem[512];\n"   // 256 x { x, y, w, glyph-or-negative-height }, rgba
+    "};\n"
+    "layout(location = 0) out vec2 vUV;\n"
+    "layout(location = 1) out vec4 vTint;\n"
+    "layout(location = 2) out float vSolid;\n"
+    "layout(location = 3) out vec4 vCell;\n"   // the cell's texel-centre bounds
+    "void main()\n"
+    "{\n"
+    "    vec4 it  = uItem[gl_InstanceID * 2];\n"
+    "    vec4 col = uItem[gl_InstanceID * 2 + 1];\n"
+    // a negative fourth component means "not a glyph": a solid rectangle whose
+    // height is the magnitude. One sign bit separates text from geometry.
+    "    float solid = it.w < 0.0 ? 1.0 : 0.0;\n"
+    "    vec2 size = solid > 0.5 ? vec2(it.z, -it.w) : vec2(it.z, it.z);\n"
+    "    vec2 pos = it.xy + aCorner * size;\n"
+    "    gl_Position = vec4(pos.x / 640.0 - 1.0,\n"     // 640 = 1280/2
+    "                       1.0 - pos.y / 360.0, 0.0, 1.0);\n"
+    // the atlas is 8x8 cells starting at ASCII 32, so the cell is two
+    // divisions of the index and there is no lookup table anywhere
+    "    float idx = max(it.w, 0.0);\n"
+    "    vec2 cell = vec2(mod(idx, 8.0), floor(idx * 0.125));\n"
+    // The coordinate runs edge to edge, so the glyph fills its quad; the
+    // fragment shader then clamps it inside the cell's outermost texel
+    // CENTRES. Both halves are needed and neither alone works: stop at the
+    // edges and the filter drags in the first row of the glyph in the next
+    // cell down (a phantom underscore under half the alphabet); shrink the
+    // coordinate to the centres instead and the glyph's own first row lands
+    // under-weighted, which reads as a top row shaved off.
+    "    vUV = (cell + aCorner) * 0.125;\n"          // 8 cells across the atlas
+    "    vCell = (vec4(cell, cell) * 16.0 + vec4(0.5, 0.5, 15.5, 15.5))\n"
+    "            * (1.0 / 128.0);\n"                 // 16 texels per cell, 128 wide
+    "    vTint = col;\n"
+    "    vSolid = solid;\n"
+    "}\n";
+
+static const char *PS_HUD =
+    "#version 450\n"
+    "layout(location = 0) in vec2 vUV;\n"
+    "layout(location = 1) in vec4 vTint;\n"
+    "layout(location = 2) in float vSolid;\n"
+    "layout(location = 3) in vec4 vCell;\n"
+    "layout(binding = 0) uniform sampler2D uFont;\n"
+    "layout(location = 0) out vec4 oColor;\n"
+    "void main()\n"
+    "{\n"
+    // clamped to the cell's outermost texel centres: the filter can reach the
+    // edge of this glyph and never past it
+    "    vec2 uv = clamp(vUV, vCell.xy, vCell.zw);\n"
+    "    float mask = vSolid > 0.5 ? 1.0 : texture(uFont, uv).a;\n"
+    "    oColor = vec4(vTint.rgb, vTint.a * mask);\n"
+    "}\n";
+
 static const char *VS_GROUND =
     "#version 450\n"
     "layout(location = 0) in vec3 aPosition;\n"
@@ -236,6 +297,12 @@ static const float FX_VERTS[] = { -1.0f, -1.0f,  1.0f, -1.0f,
                                    1.0f,  1.0f, -1.0f,  1.0f };
 static const uint16_t FX_TRIS[] = { 0, 1, 2, 0, 2, 3 };
 #define FX_STRIDE (2 * sizeof(float))
+
+// The HUD quad is the same square measured from its corner instead of its
+// centre: 2D layout puts things at a top-left, not around a middle.
+static const float HUD_VERTS[] = { 0.0f, 0.0f,  1.0f, 0.0f,
+                                   1.0f, 1.0f,  0.0f, 1.0f };
+#define HUD_STRIDE (2 * sizeof(float))
 
 // --- ground ------------------------------------------------------------------
 
@@ -294,9 +361,19 @@ typedef struct {
     const void *fxUbo;
     size_t   fxBytes;
     uint32_t fxCount;
+    // the HUD, which is the only thing that differs between the two screens
+    const CremaShader *shHud;
+    GX2RBuffer *hudVbo, *hudIbo;
+    int32_t  hudLoc;
+    uint32_t fontUnit;
+    const GX2Texture *font;
+    const GX2Sampler *fontSampler;
+    const void *hudUbo;
+    size_t   hudBytes;
+    uint32_t hudCount;
 } SceneView;
 
-static void drawScene(void *user)
+static void drawWorld(void *user)
 {
     const SceneView *s = (const SceneView *)user;
 
@@ -349,6 +426,31 @@ static void drawScene(void *user)
         CremaBlendSet(CREMA_BLEND_OPAQUE);
         CremaDepthSet(true, true);
     }
+}
+
+// The HUD pass: alpha blended, no depth at all, culling off. It is the last
+// thing drawn and it is drawn over whatever is there — on the TV that is the
+// world, on the GamePad it is an empty tactical screen.
+static void drawHud(void *user)
+{
+    const SceneView *s = (const SceneView *)user;
+    if (s->hudCount == 0)
+        return;
+
+    CremaBlendSet(CREMA_BLEND_ALPHA);
+    CremaDepthSet(false, false);
+    GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
+
+    CremaShaderBind(s->shHud);
+    GX2SetVertexUniformBlock(s->hudLoc, s->hudBytes, s->hudUbo);
+    GX2SetPixelTexture(s->font, s->fontUnit);
+    GX2SetPixelSampler(s->fontSampler, s->fontUnit);
+    GX2RSetAttributeBuffer(s->hudVbo, 0, HUD_STRIDE, 0);
+    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->hudIbo,
+                    GX2_INDEX_TYPE_U16, 6, 0, 0, s->hudCount);
+
+    CremaBlendSet(CREMA_BLEND_OPAQUE);
+    CremaDepthSet(true, true);
 }
 
 // --- the rival squadron -------------------------------------------------------
@@ -439,6 +541,145 @@ static void flightUpdate(Flight *f, const CremaInput *in, float dt)
         f->pos.y = 420.0f;
 }
 
+// --- the readouts -------------------------------------------------------------
+
+#define RADAR_RANGE 900.0f
+
+// The TV gets what you need while looking through the windscreen, and nothing
+// else: numbers pushed into the corners, a crosshair where the guns point, and
+// a bracket on the thing you are about to hit. Anything more competes with the
+// view, which is the one thing the main screen is for.
+static void buildTvHud(HudList *hud, const Flight *f, uint32_t score,
+                       uint32_t collisions, const CremaEntity *target,
+                       float targetDist, Vec3 aimPoint, Mat4 viewProj)
+{
+    const float CYAN[3] = { 0.55f, 0.88f, 1.0f };
+    const float AMBER[3] = { 1.0f, 0.74f, 0.24f };
+
+    hudClear(hud);
+
+    hudText(hud, 40.0f, 38.0f, 20.0f, "SCORE", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 130.0f, 32.0f, 28.0f, score, 3, 1.0f, 1.0f, 1.0f, 1.0f);
+    hudText(hud, 40.0f, 76.0f, 20.0f, "HITS", 1.0f, 0.45f, 0.35f, 0.9f);
+    hudNumber(hud, 130.0f, 74.0f, 22.0f, collisions, 2, 1.0f, 0.6f, 0.5f, 1.0f);
+
+    hudText(hud, 1040.0f, 38.0f, 20.0f, "SPD", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 1105.0f, 32.0f, 28.0f, (uint32_t)f->speed, 3,
+              1.0f, 1.0f, 1.0f, 1.0f);
+    hudText(hud, 1040.0f, 76.0f, 20.0f, "ALT", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 1105.0f, 74.0f, 22.0f, (uint32_t)f->pos.y, 3,
+              1.0f, 1.0f, 1.0f, 1.0f);
+
+    hudText(hud, 40.0f, 626.0f, 18.0f, "THR", CYAN[0], CYAN[1], CYAN[2], 0.85f);
+    hudBar(hud, 40.0f, 654.0f, 220.0f, 16.0f,
+           (f->speed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN), 0.3f, 0.85f, 1.0f);
+
+    // The crosshair goes where the shot lands, which is NOT the centre of the
+    // screen: the camera sits behind and above the ship, so the ray out of the
+    // nose projects lower than the middle. Aim at a point on the ray itself and
+    // the reticle sits on the gun instead of on the lens — the same reason a
+    // real gunsight is bore-sighted to a range rather than to the windscreen.
+    float ax = 640.0f, ay = 360.0f;
+    mat4_project(viewProj, aimPoint, HUD_VIRTUAL_W, HUD_VIRTUAL_H, &ax, &ay);
+    // four ticks with a hole in the middle: a solid cross would cover the one
+    // pixel you are actually aiming at
+    hudRect(hud, ax - 24.0f, ay - 1.0f, 16.0f, 2.0f, 1, 1, 1, 0.85f);
+    hudRect(hud, ax +  8.0f, ay - 1.0f, 16.0f, 2.0f, 1, 1, 1, 0.85f);
+    hudRect(hud, ax -  1.0f, ay - 24.0f, 2.0f, 16.0f, 1, 1, 1, 0.85f);
+    hudRect(hud, ax -  1.0f, ay +  8.0f, 2.0f, 16.0f, 1, 1, 1, 0.85f);
+
+    // The lock: the same projection the vertex shader does, done once on the
+    // CPU, so a 2D bracket lands exactly on a 3D ship.
+    if (target) {
+        float sx, sy;
+        if (mat4_project(viewProj, target->pos, HUD_VIRTUAL_W, HUD_VIRTUAL_H,
+                         &sx, &sy)) {
+            // the bracket shrinks with distance, like the thing it is on
+            float half = 46.0f / (1.0f + targetDist / 220.0f) + 12.0f;
+            hudFrame(hud, sx - half, sy - half, half * 2.0f, half * 2.0f, 2.0f,
+                     AMBER[0], AMBER[1], AMBER[2], 0.95f);
+            hudNumber(hud, sx - 24.0f, sy + half + 6.0f, 18.0f,
+                      (uint32_t)targetDist, 3, AMBER[0], AMBER[1], AMBER[2], 0.9f);
+            hudText(hud, sx + 22.0f, sy + half + 6.0f, 18.0f, "M",
+                    AMBER[0], AMBER[1], AMBER[2], 0.9f);
+        }
+    }
+}
+
+// The GamePad gets the job the TV cannot do: the picture from above. This is
+// the whole Star Fox Zero lesson taken the other way round — the second screen
+// is worth having when it shows something the first one physically cannot, and
+// worthless when it shows the same thing again. Here it costs no 3D pass at
+// all: the tactical screen is quads on a dark field.
+static void buildDrcHud(HudList *hud, const Flight *f,
+                        const CremaEntityPool *enemies, uint32_t score,
+                        uint32_t collisions, const CremaEntity *target)
+{
+    const float CYAN[3] = { 0.45f, 0.85f, 1.0f };
+    const float DIM[3]  = { 0.16f, 0.42f, 0.55f };
+
+    hudClear(hud);
+    hudText(hud, 40.0f, 30.0f, 26.0f, "TACTICAL", CYAN[0], CYAN[1], CYAN[2], 1.0f);
+
+    const float cx = 640.0f, cy = 380.0f, half = 250.0f;
+    hudFrame(hud, cx - half, cy - half, half * 2.0f, half * 2.0f, 2.0f,
+             DIM[0], DIM[1], DIM[2], 0.9f);
+    hudFrame(hud, cx - half * 0.5f, cy - half * 0.5f, half, half, 1.0f,
+             DIM[0], DIM[1], DIM[2], 0.5f);
+    hudRect(hud, cx - half, cy - 1.0f, half * 2.0f, 1.0f,
+            DIM[0], DIM[1], DIM[2], 0.35f);
+    hudRect(hud, cx - 1.0f, cy - half, 1.0f, half * 2.0f,
+            DIM[0], DIM[1], DIM[2], 0.35f);
+
+    uint32_t contacts = 0;
+    for (uint32_t i = 0; i < enemies->watermark; i++) {
+        const CremaEntity *e = &enemies->items[i];
+        if (!e->active)
+            continue;
+        // into the ship's own frame: forward is up, which is the only way a
+        // radar is readable while you are turning
+        float rx = e->pos.x - f->pos.x;
+        float rz = e->pos.z - f->pos.z;
+        float cyaw = cosf(f->yaw), syaw = sinf(f->yaw);
+        float u =  rx * cyaw - rz * syaw;
+        float v = -rx * syaw - rz * cyaw;
+        if (u < -RADAR_RANGE || u > RADAR_RANGE ||
+            v < -RADAR_RANGE || v > RADAR_RANGE)
+            continue;
+        contacts++;
+        float bx = cx + (u / RADAR_RANGE) * half;
+        float by = cy - (v / RADAR_RANGE) * half;
+        if (e == target) {
+            hudFrame(hud, bx - 9.0f, by - 9.0f, 18.0f, 18.0f, 2.0f,
+                     1.0f, 0.74f, 0.24f, 1.0f);
+            hudRect(hud, bx - 3.0f, by - 3.0f, 6.0f, 6.0f, 1.0f, 0.74f, 0.24f, 1.0f);
+        } else {
+            hudRect(hud, bx - 4.0f, by - 4.0f, 8.0f, 8.0f, 1.0f, 0.35f, 0.3f, 0.95f);
+        }
+    }
+
+    // you, always in the middle, always pointing up
+    hudRect(hud, cx - 4.0f, cy - 4.0f, 8.0f, 8.0f, 1.0f, 1.0f, 1.0f, 1.0f);
+    hudRect(hud, cx - 1.0f, cy - 22.0f, 2.0f, 18.0f, 1.0f, 1.0f, 1.0f, 0.8f);
+
+    hudText(hud, 40.0f, 120.0f, 20.0f, "SCORE", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 40.0f, 148.0f, 30.0f, score, 3, 1.0f, 1.0f, 1.0f, 1.0f);
+    hudText(hud, 40.0f, 200.0f, 20.0f, "HITS", 1.0f, 0.45f, 0.35f, 0.9f);
+    hudNumber(hud, 40.0f, 228.0f, 30.0f, collisions, 2, 1.0f, 0.6f, 0.5f, 1.0f);
+    hudText(hud, 40.0f, 280.0f, 20.0f, "CONTACTS", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 40.0f, 308.0f, 30.0f, contacts, 2, 1.0f, 1.0f, 1.0f, 1.0f);
+
+    hudText(hud, 970.0f, 120.0f, 20.0f, "SPD", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 970.0f, 148.0f, 30.0f, (uint32_t)f->speed, 3, 1, 1, 1, 1);
+    hudText(hud, 970.0f, 200.0f, 20.0f, "ALT", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 970.0f, 228.0f, 30.0f, (uint32_t)f->pos.y, 3, 1, 1, 1, 1);
+    hudText(hud, 970.0f, 280.0f, 20.0f, "RANGE", CYAN[0], CYAN[1], CYAN[2], 0.9f);
+    hudNumber(hud, 970.0f, 308.0f, 30.0f, (uint32_t)RADAR_RANGE, 3, 1, 1, 1, 1);
+
+    hudText(hud, 40.0f, 668.0f, 18.0f, "L-STICK FLY   ZR/ZL THROTTLE   A FIRE",
+            DIM[0] + 0.2f, DIM[1] + 0.2f, DIM[2] + 0.2f, 0.9f);
+}
+
 int main(int argc, char **argv)
 {
     if (!CremaAppInit("poc11-flight"))
@@ -452,9 +693,10 @@ int main(int argc, char **argv)
     }
 
     CremaMesh ship;
-    GX2Texture hull;
+    GX2Texture hull, font;
     if (!CremaMeshLoad(&ship, "/vol/content/ship.cmesh") ||
-        !CremaTextureLoad(&hull, "/vol/content/hull.ctex")) {
+        !CremaTextureLoad(&hull, "/vol/content/hull.ctex") ||
+        !CremaTextureLoad(&font, "/vol/content/font.ctex")) {
         WHBLogPrintf("[flight] asset load failed");
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
@@ -477,17 +719,20 @@ int main(int argc, char **argv)
         { 0, 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32 },
     };
     CremaShader *shFx = CremaShaderCompile(VS_FX, PS_FX, fxAttribs, 1);
-    if (!shShip || !shGround || !shEnemy || !shFx) {
+    CremaShader *shHud = CremaShaderCompile(VS_HUD, PS_HUD, fxAttribs, 1);
+    if (!shShip || !shGround || !shEnemy || !shFx || !shHud) {
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;
     }
 
-    GX2RBuffer groundVbo, groundIbo, fxVbo, fxIbo;
+    GX2RBuffer groundVbo, groundIbo, fxVbo, fxIbo, hudVbo, hudIbo;
     CremaBufferCreateVertex(&groundVbo, GROUND_STRIDE, 4, GROUND_VERTS);
     CremaBufferCreateIndexU16(&groundIbo, 6, GROUND_TRIS);
     CremaBufferCreateVertex(&fxVbo, FX_STRIDE, 4, FX_VERTS);
     CremaBufferCreateIndexU16(&fxIbo, 6, FX_TRIS);
+    CremaBufferCreateVertex(&hudVbo, HUD_STRIDE, 4, HUD_VERTS);
+    CremaBufferCreateIndexU16(&hudIbo, 6, FX_TRIS);   // same two triangles
 
     GX2Texture ground;
     CremaTextureCreate(&ground, GROUND_TEX, GROUND_TEX,
@@ -498,8 +743,11 @@ int main(int argc, char **argv)
     CremaTextureUploadWithMips(&ground, pixels);
     free(pixels);
 
-    GX2Sampler sampler;
+    GX2Sampler sampler, fontSampler;
     CremaSamplerInitTrilinear(&sampler, GX2_TEX_CLAMP_MODE_WRAP);
+    // The font has one level and is never minified: ask for mips it does not
+    // have and the sampler reads past the end of the chain.
+    CremaSamplerInitBilinear(&fontSampler, GX2_TEX_CLAMP_MODE_CLAMP);
 
     int32_t gVsShip   = CremaShaderVSBlockLocation(shShip, "Global");
     int32_t gPsShip   = CremaShaderPSBlockLocation(shShip, "Global");
@@ -521,6 +769,11 @@ int main(int argc, char **argv)
     int32_t fxLoc = CremaShaderVSBlockLocation(shFx, "Effects");
     if (gVsFx < 0) gVsFx = 0;
     if (fxLoc < 0) fxLoc = 1;
+    int32_t hudLoc = CremaShaderVSBlockLocation(shHud, "Hud");
+    if (hudLoc < 0) hudLoc = 0;
+    uint32_t fontUnit = 0;
+    if (shHud->ps->samplerVarCount > 0)
+        fontUnit = shHud->ps->samplerVars[0].location;
     uint32_t hullUnit = 0, groundUnit = 0, enemyUnit = 0;
     if (shShip->ps->samplerVarCount > 0)
         hullUnit = shShip->ps->samplerVars[0].location;
@@ -572,6 +825,15 @@ int main(int argc, char **argv)
     CremaUniformRing fxRing;
     CremaUniformRingCreate(&fxRing, sizeof(float) * 4 * 2 * MAX_EFFECTS,
                            CREMA_FRAMES_IN_FLIGHT);
+
+    // Two HUD rings, because the two screens show different readouts and both
+    // are in flight at once. Same rule as every other uniform here: one slice
+    // per frame the GPU might still be reading.
+    HudList tvHud, drcHud;
+    CremaUniformRing hudRingTv, hudRingDrc;
+    const size_t HUD_BYTES = sizeof(float) * 4 * 2 * HUD_MAX_ITEMS;
+    CremaUniformRingCreate(&hudRingTv, HUD_BYTES, CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&hudRingDrc, HUD_BYTES, CREMA_FRAMES_IN_FLIGHT);
 
     // --- the sounds, cooked once into DSP memory --------------------------
     // One scratch buffer, three sounds, ~85 KB of PCM. Baking them here costs a
@@ -630,8 +892,13 @@ int main(int argc, char **argv)
     view.gVsFx = gVsFx;           view.fxLoc = fxLoc;
     view.fxBytes = sizeof(float) * 4 * 2 * MAX_EFFECTS;
     view.fxCount = 0;
+    view.shHud = shHud;           view.hudVbo = &hudVbo; view.hudIbo = &hudIbo;
+    view.hudLoc = hudLoc;         view.fontUnit = fontUnit;
+    view.font = &font;            view.fontSampler = &fontSampler;
+    view.hudBytes = HUD_BYTES;    view.hudCount = 0;     view.hudUbo = NULL;
 
     static const float SKY[4] = { 0.50f, 0.62f, 0.74f, 1.0f };
+    static const float TACTICAL[4] = { 0.02f, 0.05f, 0.08f, 1.0f };
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
@@ -700,31 +967,42 @@ int main(int argc, char **argv)
             if (dz < -WORLD_HALF) e->pos.z += 2.0f * WORLD_HALF;
         }
 
-        // --- guns: a ray down the nose, nearest target wins ---
+        // --- the lock: a ray down the nose, nearest target wins ---
+        // Worked out every frame, not only when you fire, because the HUD has
+        // to show what the gun would hit. One answer, two consumers: the
+        // bracket cannot disagree with the shot if they are the same variable.
+        CremaEntity *best = NULL;
+        float bestDist = 0.0f;
+        for (uint32_t i = 0; i < enemies.watermark; i++) {
+            CremaEntity *e = &enemies.items[i];
+            if (!e->active)
+                continue;
+            float dist;
+            if (CremaRayHitsSphere(flight.pos, fwd, GUN_RANGE,
+                                   e->pos, e->radius, &dist) &&
+                (best == NULL || dist < bestDist)) {
+                best = e;
+                bestDist = dist;
+            }
+        }
+
+        // Where the shot actually ends up: the locked target if there is one,
+        // otherwise a working range. The tracer, the crosshair and the shot all
+        // read this one value, so the sight cannot disagree with the bullet.
+        float reach = best ? bestDist : 320.0f;
+        Vec3 aimPoint = { flight.pos.x + fwd.x * reach,
+                          flight.pos.y + fwd.y * reach,
+                          flight.pos.z + fwd.z * reach };
+
         // A is edge-triggered, which is the entire reason crema_input tracks
         // edges: with `held` this would fire sixty times a second.
         if (CremaInputPressed(&input, VPAD_BUTTON_A)) {
-            CremaEntity *best = NULL;
-            float bestDist = 0.0f;
-            for (uint32_t i = 0; i < enemies.watermark; i++) {
-                CremaEntity *e = &enemies.items[i];
-                if (!e->active)
-                    continue;
-                float dist;
-                if (CremaRayHitsSphere(flight.pos, fwd, GUN_RANGE,
-                                       e->pos, e->radius, &dist) &&
-                    (best == NULL || dist < bestDist)) {
-                    best = e;
-                    bestDist = dist;
-                }
-            }
             // A shot you cannot see is a shot the player will not believe:
             // muzzle flash, a line of tracer beads, and a bloom where it lands
             // A little pitch scatter, so ten shots in a row are not one shot
             // played ten times — the cheapest anti-repetition trick there is.
             CremaAudioPlay(&sndLaser, 0.80f, 0.92f + nextRandom(&rng) * 0.16f);
 
-            float reach = best ? bestDist : 320.0f;
             Vec3 muzzle = { flight.pos.x + fwd.x * 5.0f,
                             flight.pos.y + fwd.y * 5.0f,
                             flight.pos.z + fwd.z * 5.0f };
@@ -758,6 +1036,7 @@ int main(int argc, char **argv)
                     sp->velocity.z = (nextRandom(&rng) * 2.0f - 1.0f) * 48.0f;
                 }
                 CremaEntityDespawn(&enemies, best);
+                best = NULL;      // the HUD still holds it: do not bracket a corpse
                 spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
                 score++;
                 WHBLogPrintf("[flight] hit at %.0f m - score %u", bestDist, score);
@@ -774,6 +1053,8 @@ int main(int argc, char **argv)
                 CremaAudioPlay(&sndBoom, 1.0f, 0.72f);
                 CremaEffectSpawn(&fx, e->pos, 0.6f, 4.0f, 44.0f,
                                  1.0f, 0.42f, 0.12f, 1.0f);
+                if (e == best)
+                    best = NULL;
                 CremaEntityDespawn(&enemies, e);
                 spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
                 collisions++;
@@ -857,7 +1138,34 @@ int main(int argc, char **argv)
         view.fxUbo = CremaUniformRingStore(&fxRing, slot, fxData, sizeof(fxData));
         view.fxCount = fxLive;
 
-        CremaFrameDrawBoth(SKY, drawScene, &view);
+        buildTvHud(&tvHud, &flight, score, collisions, best, bestDist,
+                   aimPoint, blk.viewProj);
+        buildDrcHud(&drcHud, &flight, &enemies, score, collisions, best);
+        const void *tvHudUbo = CremaUniformRingStore(&hudRingTv, slot,
+                                                     tvHud.items, HUD_BYTES);
+        const void *drcHudUbo = CremaUniformRingStore(&hudRingDrc, slot,
+                                                      drcHud.items, HUD_BYTES);
+
+        // Not CremaFrameDrawBoth any more: the two screens no longer show the
+        // same thing. The TV gets the world with a HUD over it; the GamePad
+        // gets the tactical screen and no 3D pass at all — which is the point,
+        // because a second screen that repeats the first is a second screen
+        // you are paying for twice.
+        WHBGfxBeginRenderTV();
+        WHBGfxClearColor(SKY[0], SKY[1], SKY[2], SKY[3]);
+        drawWorld(&view);
+        view.hudUbo = tvHudUbo;
+        view.hudCount = tvHud.count;
+        drawHud(&view);
+        WHBGfxFinishRenderTV();
+
+        WHBGfxBeginRenderDRC();
+        WHBGfxClearColor(TACTICAL[0], TACTICAL[1], TACTICAL[2], TACTICAL[3]);
+        view.hudUbo = drcHudUbo;
+        view.hudCount = drcHud.count;
+        drawHud(&view);
+        WHBGfxFinishRenderDRC();
+
         CremaFrameEnd(&frame, &stats);
 
         if (stats.updated)
@@ -873,17 +1181,23 @@ int main(int argc, char **argv)
     CremaSoundDestroy(&sndBoom);
     CremaSoundDestroy(&sndLaser);
     CremaAudioShutdown();
+    CremaUniformRingDestroy(&hudRingDrc);
+    CremaUniformRingDestroy(&hudRingTv);
     CremaUniformRingDestroy(&fxRing);
     CremaUniformRingDestroy(&enemyRing);
     CremaUniformRingDestroy(&globals);
     CremaUniformFreeBlock(formation);
+    CremaBufferDestroy(&hudIbo);
+    CremaBufferDestroy(&hudVbo);
     CremaBufferDestroy(&fxIbo);
     CremaBufferDestroy(&fxVbo);
     CremaBufferDestroy(&groundIbo);
     CremaBufferDestroy(&groundVbo);
     CremaTextureDestroy(&ground);
+    CremaTextureDestroy(&font);
     CremaTextureDestroy(&hull);
     CremaMeshDestroy(&ship);
+    CremaShaderFree(shHud);
     CremaShaderFree(shFx);
     CremaShaderFree(shEnemy);
     CremaShaderFree(shGround);

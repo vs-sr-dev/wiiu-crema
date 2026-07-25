@@ -254,7 +254,7 @@ def box_reduce(pixels, w, h):
     return bytes(out), dw, dh
 
 
-def bake_texture(src, dst):
+def bake_texture(src, dst, mips=True):
     from PIL import Image
 
     img = Image.open(src).convert("RGBA")
@@ -263,8 +263,12 @@ def bake_texture(src, dst):
         raise SystemExit("%s: %dx%d is not power-of-two" % (src, w, h))
 
     levels = [bytes(img.tobytes())]
+    # Mips are mandatory for anything the world minifies (lesson 6), and wrong
+    # for a font atlas: a HUD glyph is drawn at roughly its own size, and a
+    # smaller level would only ever arrive as blur — or worse, bleed the
+    # neighbouring glyph into it once the cells are 4 pixels wide.
     lw, lh = w, h
-    while lw > 1 or lh > 1:
+    while mips and (lw > 1 or lh > 1):
         data, lw, lh = box_reduce(levels[-1], lw, lh)
         levels.append(data)
 
@@ -282,18 +286,20 @@ def bake_texture(src, dst):
 
 
 def main():
-    if len(sys.argv) != 4 or sys.argv[1] not in ("mesh", "texture"):
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = set(a for a in sys.argv[1:] if a.startswith("--"))
+    if len(args) != 3 or args[0] not in ("mesh", "texture"):
         print(__doc__ or "")
-        print("usage: crema_bake.py {mesh|texture} <input> <output>")
+        print("usage: crema_bake.py {mesh|texture} <input> <output> [--no-mips]")
         raise SystemExit(2)
 
-    kind, src, dst = sys.argv[1:4]
+    kind, src, dst = args
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     print("baking %s: %s" % (kind, src))
     if kind == "mesh":
         bake_mesh(src, dst)
     else:
-        bake_texture(src, dst)
+        bake_texture(src, dst, mips="--no-mips" not in flags)
 
 
 if __name__ == "__main__":

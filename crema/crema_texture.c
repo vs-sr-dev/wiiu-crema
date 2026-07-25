@@ -378,3 +378,11 @@ void CremaSamplerInitTrilinear(GX2Sampler *sampler, GX2TexClampMode clampMode)
                            GX2_TEX_MIP_FILTER_MODE_LINEAR);
     GX2InitSamplerLOD(sampler, 0.0f, 13.0f, 0.0f);   // 13 == any chain up to 8192
 }
+
+void CremaSamplerInitBilinear(GX2Sampler *sampler, GX2TexClampMode clampMode)
+{
+    GX2InitSampler(sampler, clampMode, GX2_TEX_XY_FILTER_MODE_LINEAR);
+    GX2InitSamplerZMFilter(sampler, GX2_TEX_Z_FILTER_MODE_NONE,
+                           GX2_TEX_MIP_FILTER_MODE_NONE);
+    GX2InitSamplerLOD(sampler, 0.0f, 0.0f, 0.0f);   // level 0 and nothing else
+}

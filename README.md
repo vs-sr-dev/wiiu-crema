@@ -1,3 +1,5 @@
+<img src="crema.png" alt="Crema" width="520">
+
 # Crema ☕
 
 **A clean-room GX2 rendering framework for Wii U homebrew** — it sits on top
@@ -83,7 +85,7 @@ while (CremaAppRunning()) {
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 36 ms |
-| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, and an engine note that rides the throttle | 60 fps, CPU idle |
+| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, an engine note that rides the throttle, and a HUD with the GamePad running its own tactical screen | 60 fps, CPU idle |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -97,6 +99,8 @@ split is deliberate: **all the thinking happens offline, on the PC.**
 python tools/gen_ship.py  examples/poc10-mesh/assets          # the example asset
 python tools/crema_bake.py mesh    assets/ship.obj content/ship.cmesh
 python tools/crema_bake.py texture assets/hull.png content/hull.ctex
+python tools/gen_font.py  examples/poc11-flight/assets/font.png
+python tools/crema_bake.py texture assets/font.png content/font.ctex --no-mips
 ```
 
 The baker interleaves vertices into the exact layout the fetch shader wants,
@@ -121,6 +125,38 @@ part sitting off-centre. Ours caught seven inside-out solids on the first run.)
 Assets ship inside the `.wuhb` via `wut_create_wuhb(... CONTENT <dir>)` and are
 read from `/vol/content/` — confirmed working on real hardware under Aroma, not
 just in Cemu.
+
+### The HUD, and giving the GamePad something to do
+
+Text is the one asset a 3D framework always ends up needing and never plans
+for. Crema's answer is the same instancing trick the billboards use, moved to
+2D: the CPU builds a list of quads, two `vec4` each, and the whole readout —
+every letter, the throttle bar, the radar blips, the bracket around a locked
+target — is **one draw call**. A negative height means "not a glyph, a solid
+rectangle", which is the entire difference between text and geometry.
+
+The font ([`tools/gen_font.py`](tools/gen_font.py)) is drawn as strokes and
+rasterised at 4x before being scaled down, so it is smooth at any size and
+still ours — no typeface imported. The first version was a hand-placed 5x7
+bitmap, which was honest and looked it.
+
+Two things worth stealing:
+
+- **Sample glyph cells clamped to their texel centres, not to their edges.**
+  Stop at the cell edge and the bilinear filter drags in the first row of the
+  glyph in the next cell down — a phantom underscore under half the alphabet.
+  Shrink the *coordinate* to the centres instead and the glyph's own first row
+  arrives under-weighted, which reads as a top row shaved off. You need the
+  quad to span the full cell and the *fetch* to be clamped inside it.
+- **The crosshair does not belong at the centre of the screen.** The camera
+  sits behind and above the ship, so the ray out of the nose projects lower
+  than the middle. Project a point on the ray itself and the sight lands on
+  the gun instead of on the lens.
+
+PoC 11 also stops calling `CremaFrameDrawBoth`: the TV gets the world with a
+HUD over it, and the GamePad gets a tactical map — radar rotated into the
+ship's own heading, contacts, the locked target — **with no 3D pass at all**.
+A second screen that repeats the first is a second screen you render twice.
 
 ### The same waveform on both machines
 

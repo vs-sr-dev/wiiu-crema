@@ -7,6 +7,7 @@
 
 #pragma once
 #include <math.h>
+#include <stdbool.h>
 
 typedef struct { float m[4][4]; } Mat4;   // m[col][row]
 typedef struct { float x, y, z; } Vec3;
@@ -99,6 +100,24 @@ static inline Vec3 vec3_normalize(Vec3 v)
     if (len < 1e-8f) { Vec3 z = {0,0,0}; return z; }
     Vec3 r = { v.x/len, v.y/len, v.z/len };
     return r;
+}
+
+// World point -> 2D screen position, the same transform the vertex shader does,
+// done once on the CPU so a HUD marker can sit on top of a thing in the world.
+// Returns false when the point is behind the camera: w <= 0 flips the divide
+// and would paint the marker for something you cannot see, mirrored, in front
+// of you. That check is the whole reason this is not two lines inline.
+static inline bool mat4_project(Mat4 viewProj, Vec3 p, float screenW,
+                                float screenH, float *outX, float *outY)
+{
+    float x = viewProj.m[0][0]*p.x + viewProj.m[1][0]*p.y + viewProj.m[2][0]*p.z + viewProj.m[3][0];
+    float y = viewProj.m[0][1]*p.x + viewProj.m[1][1]*p.y + viewProj.m[2][1]*p.z + viewProj.m[3][1];
+    float w = viewProj.m[0][3]*p.x + viewProj.m[1][3]*p.y + viewProj.m[2][3]*p.z + viewProj.m[3][3];
+    if (w <= 0.0001f)
+        return false;
+    *outX = (x / w * 0.5f + 0.5f) * screenW;
+    *outY = (0.5f - y / w * 0.5f) * screenH;   // screen y grows downwards
+    return true;
 }
 
 static inline Mat4 mat4_look_at(Vec3 eye, Vec3 center, Vec3 up)

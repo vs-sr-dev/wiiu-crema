@@ -52,7 +52,7 @@
 // git included, which notices long after a Docker-hosted compiler did not.
 #include "auxbus.h"     // our own code inside AX's signal path
 #include "echo.h"       // and the effect it runs, which knows no console at all
-#include "hud.h"        // the readout: quads in screen space, no console either
+#include "crema_hud.h"
 
 #define NUM_WINGMEN 4
 #define NUM_SHIPS   (1 + NUM_WINGMEN)

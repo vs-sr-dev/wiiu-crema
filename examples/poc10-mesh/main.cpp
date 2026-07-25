@@ -27,6 +27,7 @@
 
 #include "crema_app.h"
 #include "crema_frame.h"
+#include "crema_input.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
 #include "crema_shader.h"
@@ -241,36 +242,28 @@ int main(int argc, char **argv)
 
     static const float SPACE[4] = { 0.05f, 0.07f, 0.12f, 1.0f };
 
-    uint64_t prevTicks = OSGetSystemTime();
-    uint64_t t0 = prevTicks;
     CremaFrameStats stats;
+    CremaClock clock;
+    CremaClockInit(&clock);
+    CremaInput input;
+    CremaInputInit(&input);
 
     while (CremaAppRunning()) {
-        uint64_t nowTicks = OSGetSystemTime();
-        float dt = (float)((double)OSTicksToMicroseconds(nowTicks - prevTicks) / 1e6);
-        prevTicks = nowTicks;
-        if (dt > 0.05f)
-            dt = 0.05f;
-        float t = (float)((double)OSTicksToMilliseconds(nowTicks - t0) / 1000.0);
+        CremaClockTick(&clock);
+        float dt = clock.dt;
+        float t = clock.elapsed;
 
-        VPADStatus vpad;
-        VPADReadError vpadErr;
-        memset(&vpad, 0, sizeof(vpad));
-        VPADRead(VPAD_CHAN_0, &vpad, 1, &vpadErr);
-        if (vpadErr == VPAD_READ_SUCCESS) {
-            float lx = vpad.leftStick.x,  ly = vpad.leftStick.y;
-            float rx = vpad.rightStick.x, ry = vpad.rightStick.y;
-            if (fabsf(lx) < 0.10f) lx = 0.0f;
-            if (fabsf(ly) < 0.10f) ly = 0.0f;
-            if (fabsf(rx) < 0.10f) rx = 0.0f;
-            if (fabsf(ry) < 0.10f) ry = 0.0f;
+        CremaInputPoll(&input);
+        {
+            float lx = input.leftX,  ly = input.leftY;
+            float rx = input.rightX, ry = input.rightY;
 
             yaw   -= rx * 1.8f * dt;
             pitch += ry * 1.2f * dt;
             if (pitch >  1.45f) pitch =  1.45f;
             if (pitch < -1.45f) pitch = -1.45f;
 
-            float speed = (vpad.hold & VPAD_BUTTON_B) ? 40.0f : 12.0f;
+            float speed = CremaInputHeld(&input, VPAD_BUTTON_B) ? 40.0f : 12.0f;
             float cp = cosf(pitch), sp = sinf(pitch);
             float cy = cosf(yaw),   sy = sinf(yaw);
             Vec3 fwd   = { -sy * cp, sp, -cy * cp };
@@ -278,8 +271,8 @@ int main(int argc, char **argv)
             camPos.x += (fwd.x * ly + right.x * lx) * speed * dt;
             camPos.y += (fwd.y * ly + right.y * lx) * speed * dt;
             camPos.z += (fwd.z * ly + right.z * lx) * speed * dt;
-            if (vpad.hold & VPAD_BUTTON_ZR) camPos.y += speed * dt;
-            if (vpad.hold & VPAD_BUTTON_ZL) camPos.y -= speed * dt;
+            if (CremaInputHeld(&input, VPAD_BUTTON_ZR)) camPos.y += speed * dt;
+            if (CremaInputHeld(&input, VPAD_BUTTON_ZL)) camPos.y -= speed * dt;
         }
 
         uint32_t slot = CremaFrameBegin(&frame);

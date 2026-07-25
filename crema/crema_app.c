@@ -40,6 +40,28 @@ bool CremaAppRunning(void)
     return WHBProcIsRunning();
 }
 
+// --- clock ---------------------------------------------------------------------
+
+#define CREMA_CLOCK_MAX_DT 0.05f
+
+void CremaClockInit(CremaClock *clock)
+{
+    clock->startTicks = OSGetSystemTime();
+    clock->prevTicks  = clock->startTicks;
+    clock->dt         = 0.0f;
+    clock->elapsed    = 0.0f;
+}
+
+void CremaClockTick(CremaClock *clock)
+{
+    uint64_t now = OSGetSystemTime();
+    double seconds = (double)OSTicksToMicroseconds(now - clock->prevTicks) / 1e6;
+    clock->prevTicks = now;
+    clock->dt = seconds > CREMA_CLOCK_MAX_DT ? CREMA_CLOCK_MAX_DT : (float)seconds;
+    clock->elapsed =
+        (float)((double)OSTicksToMicroseconds(now - clock->startTicks) / 1e6);
+}
+
 // --- frame stats -------------------------------------------------------------
 
 static uint32_t sFrames;

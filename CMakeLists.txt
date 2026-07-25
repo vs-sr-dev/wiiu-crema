@@ -9,6 +9,9 @@ add_library(crema STATIC
     crema/crema_app.c
     crema/crema_buffer.c
     crema/crema_frame.c
+    crema/crema_collide.c
+    crema/crema_entity.c
+    crema/crema_input.c
     crema/crema_mesh.c
     crema/crema_shader.cpp
     crema/crema_texture.c

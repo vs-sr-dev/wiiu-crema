@@ -22,6 +22,22 @@ void CremaAppShutdown(void);
 // One iteration of the ProcUI loop; false when the app must exit (HOME menu).
 bool CremaAppRunning(void);
 
+// --- clock -------------------------------------------------------------------
+
+typedef struct {
+    uint64_t startTicks;
+    uint64_t prevTicks;
+    float    dt;         // seconds since the previous tick, clamped
+    float    elapsed;    // seconds since CremaClockInit
+} CremaClock;
+
+void CremaClockInit(CremaClock *clock);
+
+// Advance the clock. dt is clamped to 50 ms: coming back from the HOME menu
+// hands you a delta of several seconds, and an unclamped one teleports
+// everything that integrates against it through the floor.
+void CremaClockTick(CremaClock *clock);
+
 // --- frame stats -----------------------------------------------------------
 
 typedef struct {

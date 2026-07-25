@@ -31,7 +31,10 @@
 
 #include "crema_app.h"
 #include "crema_buffer.h"
+#include "crema_collide.h"
+#include "crema_entity.h"
 #include "crema_frame.h"
+#include "crema_input.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
 #include "crema_shader.h"
@@ -54,6 +57,7 @@
     "    vec4 uFogParam;\n" \
     "    vec4 uFogColor;\n" \
     "    vec4 uTime;\n"     \
+    "    vec4 uGroundOffset;\n" \
     "};\n"
 
 static const char *VS_SHIP =
@@ -103,6 +107,35 @@ static const char *PS_SHIP =
     "    oColor = vec4(mix(lit, uFogColor.rgb, fog), 1.0);\n"
     "}\n";
 
+// The rival squadron: same mesh, but each one carries its own position and
+// heading instead of riding the player's matrix.
+static const char *VS_ENEMY =
+    "#version 450\n"
+    "layout(location = 0) in vec3 aPosition;\n"
+    "layout(location = 1) in vec3 aNormal;\n"
+    "layout(location = 2) in vec2 aUV;\n"
+    GLOBAL_UBO_DECL
+    "layout(binding = 1) uniform Enemies {\n"
+    "    vec4 uEnemy[32];\n"   // xyz = position, w = heading
+    "};\n"
+    "layout(location = 0) out vec2 vUV;\n"
+    "layout(location = 1) out vec3 vNormal;\n"
+    "layout(location = 2) out vec3 vWorld;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 e = uEnemy[gl_InstanceID];\n"
+    "    float cy = cos(e.w), sy = sin(e.w);\n"
+    "    vec3 p = vec3(cy * aPosition.x + sy * aPosition.z, aPosition.y,\n"
+    "                  -sy * aPosition.x + cy * aPosition.z);\n"
+    "    vec3 n = vec3(cy * aNormal.x + sy * aNormal.z, aNormal.y,\n"
+    "                  -sy * aNormal.x + cy * aNormal.z);\n"
+    "    vec3 world = p + e.xyz;\n"
+    "    gl_Position = uViewProj * vec4(world, 1.0);\n"
+    "    vUV = aUV;\n"
+    "    vNormal = n;\n"
+    "    vWorld = world;\n"
+    "}\n";
+
 static const char *VS_GROUND =
     "#version 450\n"
     "layout(location = 0) in vec3 aPosition;\n"
@@ -112,9 +145,13 @@ static const char *VS_GROUND =
     "layout(location = 1) out vec3 vWorld;\n"
     "void main()\n"
     "{\n"
-    "    gl_Position = uViewProj * vec4(aPosition, 1.0);\n"
+    // The ground follows the player, snapped to a whole texture tile so the
+    // move is invisible: a finite quad you can fly off, or an endless world —
+    // this is the entire difference, and it costs one add.
+    "    vec3 world = aPosition + uGroundOffset.xyz;\n"
+    "    gl_Position = uViewProj * vec4(world, 1.0);\n"
     "    vUV = aUV;\n"
-    "    vWorld = aPosition;\n"
+    "    vWorld = world;\n"
     "}\n";
 
 static const char *PS_GROUND =
@@ -142,6 +179,7 @@ typedef struct {
     float fogParam[4];
     float fogColor[4];
     float time[4];
+    float groundOffset[4];
 } GlobalBlock;
 
 // --- ground ------------------------------------------------------------------
@@ -180,17 +218,21 @@ static void fillGroundTexture(uint8_t *dst)
 // --- scene draw ---------------------------------------------------------------
 
 typedef struct {
-    const CremaShader *shShip, *shGround;
+    const CremaShader *shShip, *shGround, *shEnemy;
     const CremaMesh   *ship;
     GX2RBuffer *groundVbo, *groundIbo;
     const GX2Texture *hull, *ground;
     const GX2Sampler *sampler;
-    uint32_t hullUnit, groundUnit;
+    uint32_t hullUnit, groundUnit, enemyUnit;
     int32_t  gVsShip, gPsShip, formationLoc;
     int32_t  gVsGround, gPsGround;
+    int32_t  gVsEnemy, gPsEnemy, enemyLoc;
     const void *globalUbo;
     const void *formation;
     size_t   formationBytes;
+    const void *enemyUbo;
+    size_t   enemyBytes;
+    uint32_t enemyCount;
 } SceneView;
 
 static void drawScene(void *user)
@@ -216,6 +258,47 @@ static void drawScene(void *user)
     GX2SetPixelTexture(s->hull, s->hullUnit);
     GX2SetPixelSampler(s->sampler, s->hullUnit);
     CremaMeshDraw(s->ship, NUM_SHIPS);
+
+    if (s->enemyCount > 0) {
+        CremaShaderBind(s->shEnemy);
+        GX2SetVertexUniformBlock(s->gVsEnemy, sizeof(GlobalBlock), s->globalUbo);
+        GX2SetPixelUniformBlock(s->gPsEnemy, sizeof(GlobalBlock), s->globalUbo);
+        GX2SetVertexUniformBlock(s->enemyLoc, s->enemyBytes, s->enemyUbo);
+        GX2SetPixelTexture(s->hull, s->enemyUnit);
+        GX2SetPixelSampler(s->sampler, s->enemyUnit);
+        CremaMeshDraw(s->ship, s->enemyCount);
+    }
+}
+
+// --- the rival squadron -------------------------------------------------------
+
+#define ENEMY_KIND   1
+#define ENEMY_COUNT  12
+#define MAX_ENEMIES  32
+#define ENEMY_SPEED  34.0f
+#define WORLD_HALF   900.0f
+#define GUN_RANGE    900.0f
+
+// Deterministic, so a run is reproducible when something goes wrong.
+static float nextRandom(uint32_t *state)
+{
+    *state = (*state * 1664525u) + 1013904223u;
+    return (float)((*state >> 8) & 0xFFFF) / 65535.0f;
+}
+
+// Positions are relative to the player, because the world has no centre: the
+// ground follows you, so "somewhere in the level" only means "somewhere near".
+static void spawnEnemy(CremaEntityPool *pool, uint32_t *rng, float radius,
+                       Vec3 around)
+{
+    CremaEntity *e = CremaEntitySpawn(pool, ENEMY_KIND);
+    if (!e)
+        return;   // pool full: the caller decides whether that matters
+    e->pos.x  = around.x + (nextRandom(rng) * 2.0f - 1.0f) * WORLD_HALF;
+    e->pos.z  = around.z + (nextRandom(rng) * 2.0f - 1.0f) * WORLD_HALF;
+    e->pos.y  = 25.0f + nextRandom(rng) * 220.0f;
+    e->yaw    = nextRandom(rng) * 6.2831853f;
+    e->radius = radius;
 }
 
 // --- flight model -------------------------------------------------------------
@@ -230,18 +313,13 @@ typedef struct {
 #define SPEED_CRUSE 55.0f
 #define SPEED_MAX   120.0f
 
-static void flightUpdate(Flight *f, const VPADStatus *pad, bool haveInput, float dt)
+static void flightUpdate(Flight *f, const CremaInput *in, float dt)
 {
-    float stickX = 0.0f, stickY = 0.0f;
+    float stickX = in->leftX;
+    float stickY = in->leftY;
     float throttle = 0.0f;
-    if (haveInput) {
-        stickX = pad->leftStick.x;
-        stickY = pad->leftStick.y;
-        if (fabsf(stickX) < 0.12f) stickX = 0.0f;
-        if (fabsf(stickY) < 0.12f) stickY = 0.0f;
-        if (pad->hold & VPAD_BUTTON_ZR) throttle += 1.0f;
-        if (pad->hold & VPAD_BUTTON_ZL) throttle -= 1.0f;
-    }
+    if (CremaInputHeld(in, VPAD_BUTTON_ZR)) throttle += 1.0f;
+    if (CremaInputHeld(in, VPAD_BUTTON_ZL)) throttle -= 1.0f;
 
     // Roll follows the stick and springs back to level when released — the
     // player commands an attitude, not a torque. That is what makes an arcade
@@ -258,7 +336,7 @@ static void flightUpdate(Flight *f, const VPADStatus *pad, bool haveInput, float
 
     // A banked turn: roll is what steers, exactly as in a real aircraft and in
     // every arcade flight game since.
-    f->yaw -= sinf(f->roll) * 1.15f * dt;
+    f->yaw += sinf(f->roll) * 1.15f * dt;
 
     float target = SPEED_CRUSE + throttle * (throttle > 0.0f
                    ? (SPEED_MAX - SPEED_CRUSE) : (SPEED_CRUSE - SPEED_MIN));
@@ -307,7 +385,11 @@ int main(int argc, char **argv)
     };
     CremaShader *shGround = CremaShaderCompile(VS_GROUND, PS_GROUND,
                                                groundAttribs, 2);
-    if (!shShip || !shGround) {
+    // same pixel shader, different vertex path: the enemies are placed
+    // individually instead of riding the player's transform
+    CremaShader *shEnemy = CremaShaderCompile(VS_ENEMY, PS_SHIP,
+                                              ship.attribs, ship.attribCount);
+    if (!shShip || !shGround || !shEnemy) {
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;
@@ -339,11 +421,19 @@ int main(int argc, char **argv)
     if (formLoc < 0)   formLoc = 1;
     if (gVsGround < 0) gVsGround = 0;
     if (gPsGround < 0) gPsGround = 0;
-    uint32_t hullUnit = 0, groundUnit = 0;
+    int32_t gVsEnemy = CremaShaderVSBlockLocation(shEnemy, "Global");
+    int32_t gPsEnemy = CremaShaderPSBlockLocation(shEnemy, "Global");
+    int32_t enemyLoc = CremaShaderVSBlockLocation(shEnemy, "Enemies");
+    if (gVsEnemy < 0) gVsEnemy = 0;
+    if (gPsEnemy < 0) gPsEnemy = 0;
+    if (enemyLoc < 0) enemyLoc = 1;
+    uint32_t hullUnit = 0, groundUnit = 0, enemyUnit = 0;
     if (shShip->ps->samplerVarCount > 0)
         hullUnit = shShip->ps->samplerVars[0].location;
     if (shGround->ps->samplerVarCount > 0)
         groundUnit = shGround->ps->samplerVars[0].location;
+    if (shEnemy->ps->samplerVarCount > 0)
+        enemyUnit = shEnemy->ps->samplerVars[0].location;
 
     // slot 0 is the player at the origin of its own model matrix; the wingmen
     // sit behind and beside, in ship-local space, so they bank with the leader
@@ -360,6 +450,29 @@ int main(int argc, char **argv)
 
     CremaUniformRing globals;
     CremaUniformRingCreate(&globals, sizeof(GlobalBlock), CREMA_FRAMES_IN_FLIGHT);
+    // the enemies move every frame, so their block needs a slice per frame in
+    // flight exactly like the globals do
+    CremaUniformRing enemyRing;
+    CremaUniformRingCreate(&enemyRing, sizeof(float) * 4 * MAX_ENEMIES,
+                           CREMA_FRAMES_IN_FLIGHT);
+
+    // --- the rival squadron -----------------------------------------------
+    CremaEntity enemyStorage[MAX_ENEMIES];
+    CremaEntityPool enemies;
+    CremaEntityPoolInit(&enemies, enemyStorage, MAX_ENEMIES);
+
+    // The radius comes from the AABB the baker wrote into the .cmesh — the
+    // first thing in Crema to actually use those bounds.
+    float shipRadius = CremaBoundsRadius(ship.aabbMin, ship.aabbMax);
+    WHBLogPrintf("[flight] ship bounding radius %.2f (from the baked AABB)",
+                 shipRadius);
+
+    uint32_t rng = 0x1234567u;
+    Vec3 startPoint = { 0.0f, 0.0f, 0.0f };   // where the player begins
+    for (int i = 0; i < ENEMY_COUNT; i++)
+        spawnEnemy(&enemies, &rng, shipRadius, startPoint);
+
+    uint32_t score = 0, collisions = 0;
 
     Flight flight;
     memset(&flight, 0, sizeof(flight));
@@ -383,31 +496,32 @@ int main(int argc, char **argv)
     view.formationLoc = formLoc;
     view.gVsGround = gVsGround;   view.gPsGround = gPsGround;
     view.formation = formation;   view.formationBytes = sizeof(slots);
+    view.shEnemy = shEnemy;
+    view.gVsEnemy = gVsEnemy;     view.gPsEnemy = gPsEnemy;
+    view.enemyLoc = enemyLoc;     view.enemyUnit = enemyUnit;
+    view.enemyBytes = sizeof(float) * 4 * MAX_ENEMIES;
+    view.enemyCount = 0;
 
     static const float SKY[4] = { 0.50f, 0.62f, 0.74f, 1.0f };
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
-    WHBLogPrintf("[flight] L-stick fly, ZR throttle up, ZL down. %d ships.",
-                 NUM_SHIPS);
+    WHBLogPrintf("[flight] L-stick fly (forward dives), ZR/ZL throttle, A fire."
+                 " %d wingmen, %d hostiles.", NUM_WINGMEN, ENEMY_COUNT);
 
-    uint64_t prevTicks = OSGetSystemTime();
-    uint64_t t0 = prevTicks;
     CremaFrameStats stats;
+    CremaClock clock;
+    CremaClockInit(&clock);
+    CremaInput input;
+    CremaInputInit(&input);
 
     while (CremaAppRunning()) {
-        uint64_t nowTicks = OSGetSystemTime();
-        float dt = (float)((double)OSTicksToMicroseconds(nowTicks - prevTicks) / 1e6);
-        prevTicks = nowTicks;
-        if (dt > 0.05f)
-            dt = 0.05f;
-        float t = (float)((double)OSTicksToMilliseconds(nowTicks - t0) / 1000.0);
+        CremaClockTick(&clock);
+        float dt = clock.dt;
+        float t = clock.elapsed;
 
-        VPADStatus vpad;
-        VPADReadError vpadErr;
-        memset(&vpad, 0, sizeof(vpad));
-        VPADRead(VPAD_CHAN_0, &vpad, 1, &vpadErr);
-        flightUpdate(&flight, &vpad, vpadErr == VPAD_READ_SUCCESS, dt);
+        CremaInputPoll(&input);
+        flightUpdate(&flight, &input, dt);
 
         // model matrix: yaw, then pitch, then roll, at the ship's position
         Mat4 model = mat4_mul(mat4_translate(flight.pos.x, flight.pos.y, flight.pos.z),
@@ -418,6 +532,62 @@ int main(int argc, char **argv)
         float cp = cosf(flight.pitch), sp = sinf(flight.pitch);
         float cy = cosf(flight.yaw),   sy = sinf(flight.yaw);
         Vec3 fwd = { -sy * cp, sp, -cy * cp };
+
+        // --- the squadron flies on, wrapping the world at its edges ---
+        for (uint32_t i = 0; i < enemies.watermark; i++) {
+            CremaEntity *e = &enemies.items[i];
+            if (!e->active)
+                continue;
+            e->pos.x += -sinf(e->yaw) * ENEMY_SPEED * dt;
+            e->pos.z += -cosf(e->yaw) * ENEMY_SPEED * dt;
+            // wrap around the PLAYER, not the origin: in an endless world
+            // there is no origin to wrap around
+            float dx = e->pos.x - flight.pos.x;
+            float dz = e->pos.z - flight.pos.z;
+            if (dx >  WORLD_HALF) e->pos.x -= 2.0f * WORLD_HALF;
+            if (dx < -WORLD_HALF) e->pos.x += 2.0f * WORLD_HALF;
+            if (dz >  WORLD_HALF) e->pos.z -= 2.0f * WORLD_HALF;
+            if (dz < -WORLD_HALF) e->pos.z += 2.0f * WORLD_HALF;
+        }
+
+        // --- guns: a ray down the nose, nearest target wins ---
+        // A is edge-triggered, which is the entire reason crema_input tracks
+        // edges: with `held` this would fire sixty times a second.
+        if (CremaInputPressed(&input, VPAD_BUTTON_A)) {
+            CremaEntity *best = NULL;
+            float bestDist = 0.0f;
+            for (uint32_t i = 0; i < enemies.watermark; i++) {
+                CremaEntity *e = &enemies.items[i];
+                if (!e->active)
+                    continue;
+                float dist;
+                if (CremaRayHitsSphere(flight.pos, fwd, GUN_RANGE,
+                                       e->pos, e->radius, &dist) &&
+                    (best == NULL || dist < bestDist)) {
+                    best = e;
+                    bestDist = dist;
+                }
+            }
+            if (best) {
+                CremaEntityDespawn(&enemies, best);
+                spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
+                score++;
+                WHBLogPrintf("[flight] hit at %.0f m — score %u", bestDist, score);
+            }
+        }
+
+        // --- and flying into one counts too ---
+        for (uint32_t i = 0; i < enemies.watermark; i++) {
+            CremaEntity *e = &enemies.items[i];
+            if (!e->active)
+                continue;
+            if (CremaSphereHitsSphere(flight.pos, shipRadius, e->pos, e->radius)) {
+                CremaEntityDespawn(&enemies, e);
+                spawnEnemy(&enemies, &rng, shipRadius, flight.pos);
+                collisions++;
+                WHBLogPrintf("[flight] collision! (%u so far)", collisions);
+            }
+        }
 
         // Chase camera: lag behind the ideal spot instead of snapping to it.
         // The lag IS the feeling of speed — a rigid camera looks like the world
@@ -451,7 +621,32 @@ int main(int argc, char **argv)
         blk.fogColor[0] = SKY[0]; blk.fogColor[1] = SKY[1];
         blk.fogColor[2] = SKY[2]; blk.fogColor[3] = 1.0f;
         blk.time[0] = t; blk.time[1] = blk.time[2] = blk.time[3] = 0.0f;
+        // snap to a whole texture tile, so the ground moving with you is
+        // invisible: one add in the shader turns a finite quad into a world
+        const float tile = (GROUND_HALF * 2.0f) / GROUND_UV;
+        blk.groundOffset[0] = floorf(flight.pos.x / tile) * tile;
+        blk.groundOffset[1] = 0.0f;
+        blk.groundOffset[2] = floorf(flight.pos.z / tile) * tile;
+        blk.groundOffset[3] = 0.0f;
         view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
+
+        // pack the live enemies into the instance array, contiguously: the
+        // draw indexes it by gl_InstanceID, so holes would draw ghosts
+        float enemyData[MAX_ENEMIES][4];
+        uint32_t live = 0;
+        for (uint32_t i = 0; i < enemies.watermark && live < MAX_ENEMIES; i++) {
+            const CremaEntity *e = &enemies.items[i];
+            if (!e->active)
+                continue;
+            enemyData[live][0] = e->pos.x;
+            enemyData[live][1] = e->pos.y;
+            enemyData[live][2] = e->pos.z;
+            enemyData[live][3] = e->yaw;
+            live++;
+        }
+        view.enemyUbo = CremaUniformRingStore(&enemyRing, slot, enemyData,
+                                              sizeof(enemyData));
+        view.enemyCount = live;
 
         CremaFrameDrawBoth(SKY, drawScene, &view);
         CremaFrameEnd(&frame, &stats);
@@ -462,6 +657,7 @@ int main(int argc, char **argv)
     }
 
     CremaFrameSettle(&frame);
+    CremaUniformRingDestroy(&enemyRing);
     CremaUniformRingDestroy(&globals);
     CremaUniformFreeBlock(formation);
     CremaBufferDestroy(&groundIbo);
@@ -469,6 +665,7 @@ int main(int argc, char **argv)
     CremaTextureDestroy(&ground);
     CremaTextureDestroy(&hull);
     CremaMeshDestroy(&ship);
+    CremaShaderFree(shEnemy);
     CremaShaderFree(shGround);
     CremaShaderFree(shShip);
     CremaShaderShutdownCompiler();

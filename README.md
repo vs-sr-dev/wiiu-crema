@@ -52,7 +52,14 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   forgotten, reclaimed when they end; a held voice you own and retune every
   frame. Init it *first*: until a title takes AX over, the system keeps playing
   the transition audio it was handed — which is the Wii U Menu's music
-- **crema_matrix** — column-major mat4/vec3 math, GL conventions
+- **crema_pak** — a `.cpak` archive: one open, two reads, however many assets
+  are inside, because on this console the cost of an asset is dominated by
+  touching its file at all. No compression and no transformation — a directory
+  followed by a concatenation. The mesh and texture loaders grew in-memory
+  twins to go with it, and the from-a-path versions are now the special case
+- **crema_matrix** — column-major mat4/vec3 math, GL conventions, and the
+  world-to-screen projection a HUD marker needs (including the check that
+  keeps a marker from appearing for something behind the camera)
 
 Nothing here was designed in advance. Every module was extracted from an
 example that had already written it — twice, usually — which is why the layer
@@ -84,7 +91,7 @@ while (CremaAppRunning()) {
 | 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **1.67 Gpix/s** flat fill |
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
-| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit | 59.9 fps, 356 KB loaded in 36 ms |
+| 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, an engine note that rides the throttle, and a HUD with the GamePad running its own tactical screen | 60 fps, CPU idle |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
@@ -210,6 +217,34 @@ The one thing that turned out not to matter: waiting for the GPU. We batched
 nine per-level syncs into one expecting to save real time and saved nothing
 measurable — those copies are tiny and the GPU is idle. The instrumentation was
 the part that paid off, not the optimisation it shipped with.
+
+### Cashing that in: `.cpak`, one archive, two reads
+
+The archive format follows from the numbers above and contains no cleverness:
+no compression, no transformation, just a directory followed by a
+concatenation. What it buys is that **opening it costs two reads no matter how
+many assets are inside** — the header says how long the rest is, and the rest
+arrives in one call.
+
+PoC 10 loads the same two assets both ways in the same run, because a
+measurement taken on another day on another card is not a comparison:
+
+| | on real hardware |
+|---|---|
+| two loose files | **38.95 ms** |
+| the same two in one `.cpak` | **32.33 ms** (−17%) |
+
+The 6.6 ms saved is exactly the fixed cost of the second file: one `fopen`
+(0.14), one first-read-on-a-stream (3.13), one more read call. Which is the
+part worth understanding — **the win scales with the number of files, not with
+their size**, and two assets is the least favourable case there is. Twenty
+assets in twenty files would spend ~80 ms before reading anything useful; in
+one archive they would spend ~4.
+
+What is left is honest bandwidth: of the 32 ms, 21.8 is 355 KB arriving at
+16.7 MB/s and 3.7 is staging into the GPU. All the per-file overhead is now
+gone, so the only lever remaining is moving fewer bytes — which is compression,
+a different piece of work with a different trade.
 
 ## Lessons learned (Cemu vs real hardware)
 

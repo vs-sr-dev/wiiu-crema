@@ -52,6 +52,13 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   forgotten, reclaimed when they end; a held voice you own and retune every
   frame. Init it *first*: until a title takes AX over, the system keeps playing
   the transition audio it was handed — which is the Wii U Menu's music
+- **crema_bank** — instruments: PCM plus the number that makes a sample an
+  instrument, how many samples are one cycle. A note is then a playback rate
+  and nothing else. The bank keeps its own cache-flushed copy, because unlike
+  a texture an instrument is read by the DSP *while it plays*
+- **crema_music** — the sequencer, ticking on AX's audio frame (3 ms) instead
+  of on the game loop, and never allocating there: channels reserve their
+  voices up front, and a note-on re-aims a voice the channel already owns
 - **crema_pak** — a `.cpak` archive: one open, two reads, however many assets
   are inside, because on this console the cost of an asset is dominated by
   touching its file at all. No compression and no transformation — a directory
@@ -92,7 +99,7 @@ while (CremaAppRunning()) {
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
-| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, an engine note that rides the throttle, and a HUD with the GamePad running its own tactical screen | 60 fps, CPU idle |
+| 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -165,23 +172,63 @@ HUD over it, and the GamePad gets a tactical map — radar rotated into the
 ship's own heading, contacts, the locked target — **with no 3D pass at all**.
 A second screen that repeats the first is a second screen you render twice.
 
-### The same waveform on both machines
+### Sound: the console is a sampler, so the chip is made offline
 
-PoC 11's sounds are generated in plain C in
-[`sounds.h`](examples/poc11-flight/sounds.h) — a file with no console header in
-it. That is not tidiness: it means `tools/render_sounds.c` can compile *the same
-source* on a PC and write WAVs, so the offline preview is the sound, not a
-model of it.
+AX is not a file player and there is no synthesiser anywhere in it. It is a
+hardware sampler: PCM in memory, a pitch, a loop point. Which turns out to be
+enough, because **a sampler with pitch and loop control _is_ a sound chip** — a
+pulse wave is one cycle in a loop with the duty already baked in, a NES triangle
+is its sixteen steps written out exactly, noise is an LFSR sequence generated
+once. Each maps onto a voice with nothing left over, and unlike the chip it
+imitates you are not limited to four of them.
+
+So the waveforms are made on the PC, where a wrong number is a rerun instead of
+a rebuild:
 
 ```sh
-cc -O2 -o render_sounds tools/render_sounds.c -lm && ./render_sounds out/
+python tools/gen_waves.py examples/poc11-flight/assets/audio   # WAVs + manifest
+python tools/crema_bake.py bank content/audio.cbank assets/audio/bank.json
+python tools/gen_song.py  examples/poc11-flight/assets/audio/theme.csong
 ```
 
-It reports what an ear cannot: the explosion was clipping 550 samples flat on
-its attack (fixed with a `tanh` saturation — an explosion should be squashed,
-but by a curve, not a ceiling), and the engine loop's wrap-around step is 359
-against a largest in-loop step of 423, so the loop closes without the tick you
-would otherwise hear five times a second and blame on the DSP.
+What comes out of the generator is ordinary 16-bit mono WAV, so the preview tool
+is whatever plays WAVs on your machine. It also prints what an ear cannot: the
+explosion was clipping 550 samples flat on its attack (now saturated by a `tanh`
+— an explosion should sound squashed, but by a curve, not by a ceiling), and the
+engine loop's wrap-around step is 359 against a largest in-loop step of 423, so
+the loop closes without the tick you would otherwise hear five times a second
+and blame on the DSP.
+
+The `.cbank` adds the one number a WAV cannot carry and an instrument cannot do
+without: how many samples make one cycle. From it, a note is only a playback
+rate — `ratio = frequency * cycleSamples / rate` — and that is the entire theory
+of playing music on this hardware.
+
+A song (`.csong`) is **a piano roll, not a pattern grid**: a flat list of events
+sorted in time, so importing one from a piano-roll editor later is a translation
+rather than a redesign. It names its instruments instead of indexing them, so a
+bank and a song can be rebuilt separately.
+
+### The sequencer runs on AX's clock, not on yours
+
+`AXRegisterAppFrameCallback` gives you a tick per audio frame — **3 ms, 333
+times a second**, on AX's thread, in time with the DSP rather than with the
+picture. That is the difference between music and music that stutters: a game
+loop can only place a note to the nearest 16.7 ms, and at 132 BPM a sixteenth
+note is 113 ms, so every note would land up to a seventh of its own length late
+and land differently each time.
+
+The price is a rule, and it is the oldest one in real-time audio: **the callback
+never allocates and never blocks.** Each channel reserves its voice once, on the
+game thread, before the song starts; from then on a note-on is a re-aiming of a
+voice the channel already owns and a note-off is a stop. Nothing is acquired or
+freed while the song plays, so the audio thread and the game thread never have
+to agree about who owns what — there is nothing to race over, and no lock in the
+one place a lock would be heard.
+
+Measured in Cemu (the console's own number is not in yet): 333 ticks/s, **1 µs
+per tick typical, 42 µs worst against a 3000 µs frame** — 1.4% of the audio
+thread, playing four channels.
 
 ### What loading actually costs (measured on console)
 

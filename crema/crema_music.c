@@ -35,7 +35,13 @@ typedef struct {
     uint8_t  note;
     uint8_t  instrument;
     uint8_t  volume;
-    uint8_t  pad[3];
+    // Cents off the note. It exists because a real chip cannot play in tune:
+    // its pitch comes from an integer divider, so an E6 on a NES is 3.3 cents
+    // flat and always the same 3.3 cents flat. Throwing that away and playing
+    // the correct note is the one change that makes a chip tune stop sounding
+    // like the machine it was written for.
+    int8_t   detune;
+    uint8_t  pad[2];
 } SongEvent;
 _Static_assert(sizeof(SongEvent) == 12, "csong event is 12 bytes");
 
@@ -86,8 +92,9 @@ static void applyEvent(CremaMusic *m, const SongEvent *e)
     // 64 is full in the file, the way every piano roll and every tracker before
     // it has counted volume.
     float vol = (float)e->volume / 64.0f * m->volume;
+    float note = (float)e->note + (float)e->detune / 100.0f;
     CremaAudioVoiceRetrigger(voice, &inst->sound, vol,
-                             CremaInstrumentPitch(inst, (float)e->note));
+                             CremaInstrumentPitch(inst, note));
     m->stats.notesOn++;
 }
 

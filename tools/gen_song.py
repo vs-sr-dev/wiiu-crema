@@ -59,14 +59,19 @@ class Song:
         return self.instruments.index(name)
 
     def play(self, channel, instrument, note, start_beats, length_beats,
-             volume=48):
-        """One note on a piano roll: where it starts, how long it is held."""
+             volume=48, detune=0):
+        """One note on a piano roll: where it starts, how long it is held.
+
+        `detune` is in cents and is how a real chip's out-of-tuneness survives
+        the trip: its pitch comes from an integer divider, so its E6 is a few
+        cents flat and always the same few cents flat."""
         idx = self.inst(instrument)
         midi = n(note) if isinstance(note, str) else note
         t0 = self.beat_ms(start_beats)
         t1 = self.beat_ms(start_beats + length_beats)
-        self.events.append((t0, channel, NOTE_ON, midi, idx, volume))
-        self.events.append((t1, channel, NOTE_OFF, midi, idx, 0))
+        cents = max(-127, min(127, int(round(detune))))
+        self.events.append((t0, channel, NOTE_ON, midi, idx, volume, cents))
+        self.events.append((t1, channel, NOTE_OFF, midi, idx, 0, 0))
 
     def line(self, channel, instrument, notes, start_beats, step_beats,
              length=None, volume=48):
@@ -89,9 +94,9 @@ class Song:
             fh.write(b"\0" * (HEADER_SIZE - fh.tell()))
             for name in self.instruments:
                 fh.write(name.encode("ascii")[:23].ljust(24, b"\0"))
-            for (t, ch, typ, note, inst, vol) in self.events:
-                fh.write(struct.pack(">IBBBBBBBB", t, ch, typ, note, inst, vol,
-                                     0, 0, 0))
+            for (t, ch, typ, note, inst, vol, cents) in self.events:
+                fh.write(struct.pack(">IBBBBBbBB", t, ch, typ, note, inst, vol,
+                                     cents, 0, 0))
         print("  %s: %d events, %d channels, %d instruments, %.1f s, loops at %.1f s"
               % (path, len(self.events), self.channels, len(self.instruments),
                  end / 1000.0, self.beat_ms(loop_beats) / 1000.0))

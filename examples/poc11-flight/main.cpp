@@ -700,7 +700,7 @@ int main(int argc, char **argv)
     GX2Texture hull, font;
     CremaBank bank;
     memset(&bank, 0, sizeof(bank));
-    CremaMusic *music = NULL;
+    CremaMusic *music = NULL, *chiproll = NULL;
     bool assetsOk = false;
     {
         CremaPak pak;
@@ -719,6 +719,15 @@ int main(int argc, char **argv)
                 CremaBankLoadFromMemory(&bank, bankBlob, bankBytes);
             if (assetsOk && songBlob)
                 CremaMusicLoadFromMemory(&music, songBlob, songBytes, &bank);
+            // The second song is the same pipeline from the other end: written
+            // in chiproll, exported, imported. It carries the NES's own
+            // out-of-tuneness note by note, which is the whole reason to
+            // import from a chip editor rather than retype the notes.
+            size_t chipBytes = 0;
+            const void *chipBlob = CremaPakFind(&pak, "chiproll.csong",
+                                                &chipBytes);
+            if (assetsOk && chipBlob)
+                CremaMusicLoadFromMemory(&chiproll, chipBlob, chipBytes, &bank);
             // Everything has its own copy now — the GPU for the two textures
             // and the mesh, the bank for its samples, because the DSP will
             // still be reading those while the ship flies.
@@ -916,8 +925,9 @@ int main(int argc, char **argv)
 
     // The song starts here, not at load: the callback ticks against the DSP
     // from this moment and nothing about the frame loop can hurry or delay it.
-    if (music)
-        CremaMusicStart(music);
+    CremaMusic *playing = chiproll ? chiproll : music;
+    if (playing)
+        CremaMusicStart(playing);
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
@@ -937,6 +947,18 @@ int main(int argc, char **argv)
 
         CremaInputPoll(&input);
         flightUpdate(&flight, &input, dt);
+
+        // MINUS swaps the two songs — the hand-written one and the one that
+        // came out of chiproll. An audition mode is worth more than an editor
+        // on a console: the only question you cannot answer on the PC is
+        // whether it sounds right coming out of a television.
+        if (CremaInputPressed(&input, VPAD_BUTTON_MINUS) && music && chiproll) {
+            CremaMusicStop(playing);
+            playing = (playing == chiproll) ? music : chiproll;
+            CremaMusicStart(playing);
+            WHBLogPrintf("[flight] now playing the %s song",
+                         playing == chiproll ? "chiproll" : "hand-written");
+        }
 
         // The engine note rides the throttle: one 0.2 s loop, resampled. This
         // is the whole trick a sampler is capable of — the sound never changes,
@@ -1190,7 +1212,7 @@ int main(int argc, char **argv)
         if (stats.updated) {
             CremaMusicStats ms;
             memset(&ms, 0, sizeof(ms));
-            CremaMusicGetStats(music, &ms);
+            CremaMusicGetStats(playing, &ms);
             WHBLogPrintf("[flight] %.1f fps | speed %.0f | alt %.0f | sync %.2f ms"
                          " | voices %u | seq %u us last, %u us worst, %u ticks,"
                          " %u notes, %u loops",
@@ -1202,6 +1224,7 @@ int main(int argc, char **argv)
 
     CremaFrameSettle(&frame);
     CremaAudioRelease(engineVoice);
+    CremaMusicClose(chiproll);
     CremaMusicClose(music);
     CremaBankClose(&bank);
     CremaAudioShutdown();

@@ -19,7 +19,8 @@ crema_pak("${POC11_CONTENT}/assets.cpak"
           "${CMAKE_CURRENT_SOURCE_DIR}/../poc10-mesh/content/hull.ctex"
           "${CMAKE_CURRENT_SOURCE_DIR}/content/font.ctex"
           "${CMAKE_CURRENT_BINARY_DIR}/audio.cbank"
-          "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio/theme.csong")
+          "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio/theme.csong"
+          "${CMAKE_CURRENT_SOURCE_DIR}/assets/audio/chiproll.csong")
 
 wut_create_wuhb(poc11_flight
     NAME      "GX2 PoC11 - Flight"

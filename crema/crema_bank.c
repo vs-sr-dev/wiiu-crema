@@ -125,8 +125,15 @@ void CremaBankClose(CremaBank *bank)
 
 float CremaInstrumentPitch(const CremaInstrument *inst, float note)
 {
-    if (!inst || inst->cycleSamples == 0 || inst->sound.rate == 0)
-        return 1.0f;   // not pitched: its own rate is the only rate it has
+    if (!inst)
+        return 1.0f;
+    if (inst->cycleSamples == 0 || inst->sound.rate == 0) {
+        // Not pitched — a drum, a noise loop. There is no cycle to tune, so
+        // the note transposes the sample itself, with 60 meaning "as recorded".
+        // Every sampler ever built does this, and it is what lets a noise
+        // channel have a low hit and a high one from the same four kilobytes.
+        return powf(2.0f, (note - 60.0f) / 12.0f);
+    }
     // 69 is A4. The twelfth root of two, and then the only step that matters:
     // the frequency a cycle of N samples has to be read at to sound at that
     // pitch is f * N, and everything else in this file is bookkeeping.

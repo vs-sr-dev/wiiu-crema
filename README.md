@@ -205,9 +205,37 @@ rate — `ratio = frequency * cycleSamples / rate` — and that is the entire th
 of playing music on this hardware.
 
 A song (`.csong`) is **a piano roll, not a pattern grid**: a flat list of events
-sorted in time, so importing one from a piano-roll editor later is a translation
-rather than a redesign. It names its instruments instead of indexing them, so a
-bank and a song can be rebuilt separately.
+sorted in time. It names its instruments instead of indexing them, so a bank and
+a song can be rebuilt separately.
+
+### Importing from chiproll, detuning included
+
+That shape was chosen so that importing from a piano-roll editor would be a
+translation rather than a redesign, and
+[chiproll](https://github.com/vs-sr-dev/chiproll) is the editor in question:
+
+```sh
+python tools/chiproll_import.py session.json content/song.csong
+```
+
+Its export carries, per step, both the note you meant and the register the chip
+would actually be given — and, because those two do not agree, how many cents
+apart they are. **That disagreement is worth importing.** A NES makes its pitch
+by dividing a clock by an integer, so it cannot play in tune: E6 comes out 3.3
+cents flat, every time, on every NES ever built. Take the notes and you have the
+tune; take the notes *and the cents* and you have the machine. So `.csong`
+events carry a signed cents byte, and the player adds it as a fraction of a
+semitone — which the resampler was always able to do and nothing else in the
+chain had to change.
+
+In the imported test session, 23 of its 25 pitched notes are somewhere other
+than where equal temperament would put them.
+
+The two things chiproll's format leaves to the reader, and what the importer
+assumes: a step is a sixteenth (`--steps-per-beat`), and a step with no note is
+a rest rather than a held one — there is a single `null` for both meanings, and
+the sessions read as step sequences (`--gate` sets how much of its step a note
+holds).
 
 ### The sequencer runs on AX's clock, not on yours
 
@@ -226,9 +254,17 @@ freed while the song plays, so the audio thread and the game thread never have
 to agree about who owns what — there is nothing to race over, and no lock in the
 one place a lock would be heard.
 
-Measured in Cemu (the console's own number is not in yet): 333 ticks/s, **1 µs
-per tick typical, 42 µs worst against a 3000 µs frame** — 1.4% of the audio
-thread, playing four channels.
+Measured on real hardware, four channels playing: **333.4 ticks/s and 14 µs in
+the worst tick against a 3000 µs frame** — 0.47% of the audio thread, with the
+game still at 59.9 fps and 0.00 ms of CPU sync. The voice count sits at 5 and
+never climbs, which is the check that matters: five is four channels plus the
+engine, and a sequencer that leaked voices would walk it up to the pool limit
+and go silent.
+
+Worth noting that the console beat the emulator here — Cemu reported 42 µs for
+the same work. It recompiles PPC to x86, but it measures time through its own
+overhead, while on hardware `OSGetSystemTime` reads the real timebase and the
+code is native.
 
 ### What loading actually costs (measured on console)
 

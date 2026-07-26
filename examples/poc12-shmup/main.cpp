@@ -63,7 +63,7 @@
 // forward, the player sits near the bottom and everything hostile comes from
 // -Z. Nothing here moves in Y, which is what makes a 3D engine draw a 2D game.
 
-#define FIELD_X       30.0f     // half-width the player may reach
+#define FIELD_X       35.0f     // half-width the player may reach
 #define FIELD_NEAR    16.0f     // player's limit toward the camera
 #define FIELD_FAR    -34.0f     // where enemies enter
 #define DESPAWN_Z     28.0f     // past the player: gone
@@ -88,6 +88,20 @@ enum {
 #define FIRE_INTERVAL    0.14f
 #define INVULN_TIME      1.6f
 #define START_LIVES      3
+
+// A ceiling on how many of them may exist at once, and it is not a difficulty
+// setting — it is what keeps the pool from filling.
+//
+// Waves arrive on a timer that shortens as the game goes on, and enemies take
+// about five seconds to cross the field, so without a cap the two rates settle
+// wherever they happen to meet: the log showed the entity count climbing 5, 14,
+// 24, 36, 52 and never coming back down. Nothing looks wrong on screen until
+// the pool runs out — and then `spawn` returns NULL for whoever asks next,
+// which sooner or later is the player's own gun. A game that quietly stops
+// firing is a worse bug than a game that is too hard, and the same number fixes
+// both: difficulty now grows in speed and rate of fire rather than by piling up
+// ships nobody can shoot down fast enough.
+#define MAX_LIVE_ENEMIES 22
 
 // --- shaders -----------------------------------------------------------------
 
@@ -342,6 +356,15 @@ static CremaEntity *findPlayer(Game *g)
 
 // A wave is a row of ships entering together with a shared sway. Difficulty is
 // one number growing: they come sooner, faster, and shoot more often.
+static uint32_t countKind(const Game *g, uint32_t kind)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g->pool.watermark; i++)
+        if (g->pool.items[i].active && g->pool.items[i].kind == kind)
+            n++;
+    return n;
+}
+
 static void launchWave(Game *g)
 {
     g->wave++;
@@ -483,8 +506,16 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
     }
 
     g->waveTimer -= dt;
-    if (g->waveTimer <= 0.0f)
-        launchWave(g);
+    if (g->waveTimer <= 0.0f) {
+        if (countKind(g, KIND_ENEMY) < MAX_LIVE_ENEMIES) {
+            launchWave(g);
+        } else {
+            // The field is full: wait a beat and ask again, rather than skip
+            // the wave. The player is falling behind, and the game noticing
+            // that is the difference between pressure and a pile-up.
+            g->waveTimer = 0.35f;
+        }
+    }
 }
 
 // --- rendering ---------------------------------------------------------------

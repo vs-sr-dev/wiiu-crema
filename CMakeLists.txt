@@ -21,6 +21,7 @@ add_library(crema STATIC
     crema/crema_music.c
     crema/crema_pak.c
     crema/crema_save.c
+    crema/crema_scene.c
     crema/crema_shader.cpp
     crema/crema_texture.c
 )
@@ -62,3 +63,4 @@ add_subdirectory(examples/poc9-scene)
 add_subdirectory(examples/poc10-mesh)
 add_subdirectory(examples/poc11-flight)
 add_subdirectory(examples/poc12-shmup)
+add_subdirectory(examples/poc13-quest)

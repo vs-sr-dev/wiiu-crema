@@ -164,7 +164,7 @@ handed back.
 | 4 | `poc4-gouraud` | procedural torus, per-vertex diffuse+specular | 60 fps |
 | 5 | `poc5-stress` | geometry throughput, escalating workload, vsync off | **130 Mtris/s** @ 1.18M tris/frame |
 | 6 | `poc6-engine` | naive draws vs display list vs instancing | **159 fps / 188 Mtris/s** (instanced) |
-| 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **1.67 Gpix/s** flat fill |
+| 7 | `poc7-fillrate` | ROP fill, linear-vs-tiled textures, per-pixel ALU cost | **3.76 Gpix/s** flat fill at 1920x1080 — 85% of the R7xx ceiling |
 | 8 | `poc8-fence` | GX2DrawDone vs fenced pipelining, double-buffered UBOs | **162.6 fps / 191.8 Mtris/s** |
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
@@ -1096,6 +1096,54 @@ by 150. Four scenes with a struct and five callbacks each are more code than a
 better. The shape earns its keep when there are two places with different
 lifetimes.
 
+### The benchmark that divided by the wrong number
+
+**This console fills pixels 2.25× faster than this file used to say.**
+`poc7-fillrate` draws a fullscreen triangle in clip space, so it covers
+**whatever render target WHBGfx allocated** — and WHBGfx allocates from the
+console's own display setting: 1280x720 on a console set to 720p, 1920x1080 on
+one set to 1080p. Two `#define`s at the top of the file said 1280 and 720 while
+the hardware was handing us 1920x1080, and 1920×1080 ÷ 1280×720 is exactly 2.25.
+
+A fill rate is a property of the chip and not of the target it is aimed at, so
+the mistake did not make the old figure "correct for 720p" — it understated the
+Latte at every resolution. Re-measured with the size **asked for at runtime**:
+
+| mode | | as it was reported | actual (1920x1080) |
+|---|---|---|---|
+| A | flat colour | 1.67 Gpix/s | **3.76 Gpix/s** |
+| B | one bilinear tap, linear layout | — | 3.71 Gpix/s |
+| C | one bilinear tap, tiled layout | — | 3.76 Gpix/s |
+| D | tiled + per-pixel Blinn-Phong | — | **0.77 Gpix/s** |
+
+Only mode A ever reached this file; B, C and D were logged on the console and
+never written down, so there is nothing to retract about them beyond the
+denominator they were divided by.
+
+3.76 Gpix/s is 85% of the 4.4 an 8-ROP part at 550 MHz can theoretically
+retire, which is where a flat fill with no depth test belongs. 38% was low
+enough to look like a finding about the hardware, and it was a finding about a
+`#define`. **A benchmark that reports a rate has to measure its own
+denominator**: poc7 now prints the size it measured into, and `CremaAppInit`
+logs the render targets it was handed, so no example has to assume this again.
+
+What it means in practice is a 720p number, because that is the resolution the
+Wii U actually targeted — the list of games rendering at native 1080p is short
+and almost entirely 2D. At 720p the budget is **≈68 fullscreen opaque layers
+per frame at 60 fps**, where this file used to claim 30.
+
+**And one thing here is a retraction rather than a correction.** Modes B and C
+exist to quantify the linear-versus-tiled texture penalty, and at this overdraw
+**they cannot**: A (no texture at all) and C (a tiled texture) both report 3.76
+Gpix/s, identical. The workload is ROP-bound, so one bilinear tap hides
+completely behind the fill and the 1.3% between B and C is inside the
+run-to-run spread. This benchmark measures fill rate honestly and measures
+nothing at all about texture layout. It does not contradict PoC 9, where a
+mip-less ground *halved* the frame rate: that regime thrashes the texture cache
+with wildly varying texels, and this one reads the same cached tap 32 times.
+Same chip, opposite bottleneck — and the layout question needs the other kind
+of test to answer it.
+
 ### The clock is not the frame
 
 Every example before PoC 14 integrated against the frame: `pos += vel *
@@ -1402,8 +1450,14 @@ compiler entirely (the Immaterial demo pattern).
 
 - Geometry: **191.8 Mtris/s** sustained (Gouraud, instanced, fenced) ≈ 1.8
   cycles/triangle — near the 1 tri/clock setup limit. ~2.2M tris/frame @ 60 fps.
-- Fill: **1.67 Gpix/s** opaque (≈30 fullscreen 720p layers per frame @ 60).
-- Heavy per-pixel math (≈10 transcendentals): ~2.7 ms per fullscreen 720p pass.
+- Fill: **3.76 Gpix/s** opaque — 85% of the 4.4 an 8-ROP part at 550 MHz can
+  theoretically retire. That is **≈68 fullscreen 720p layers per frame at 60**,
+  or ≈30 at 1080p. Measured into a 1920x1080 target and stated for 720p because
+  that is what a Wii U game targets. One bilinear tap costs nothing against it:
+  flat and textured land within 1.3% of each other.
+- Heavy per-pixel math (≈10 transcendentals): **0.77 Gpix/s**, so ~1.2 ms per
+  fullscreen 720p pass (2.7 ms at 1080p). Five times dearer than a flat fill,
+  and the only mode in that benchmark that is not ROP-bound.
 - Audio: AX reports **96 voices** over a 48 kHz mix, resampling each one from
   whatever rate you baked it at. A handful playing cost nothing we could
   measure — the frame stayed at 59.9 fps with 0.00 ms of CPU sync.

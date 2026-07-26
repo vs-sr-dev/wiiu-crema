@@ -23,6 +23,19 @@ bool CremaAppInit(const char *name)
         WHBLogPrintf("[%s] WHBGfxInit failed", sAppName);
         return false;
     }
+
+    // What we are actually rendering into, asked rather than assumed. WHBGfx
+    // picks the TV render mode from the console's own display setting, so the
+    // same binary is 1280x720 on one console and 1920x1080 on the next — and
+    // every fill-rate number in this repository means something different
+    // depending on which. Worth one line at startup.
+    const GX2ColorBuffer *tv = WHBGfxGetTVColourBuffer();
+    const GX2ColorBuffer *drc = WHBGfxGetDRCColourBuffer();
+    if (tv && drc)
+        WHBLogPrintf("[%s] render targets: TV %ux%u, GamePad %ux%u (%u AA "
+                     "samples)", sAppName, tv->surface.width,
+                     tv->surface.height, drc->surface.width,
+                     drc->surface.height, tv->surface.aa);
     return true;
 }
 

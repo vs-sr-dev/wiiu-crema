@@ -3,7 +3,9 @@
 //
 // GX2 PoC 7 — fill-rate / texture / pixel-ALU benchmark.
 //   - one fullscreen triangle drawn OVERDRAW times per frame via instancing
-//     (TV 1280x720 only, vsync off, depth test off so every layer shades)
+//     (vsync off, depth test off so every layer shades). The render target is
+//     whatever WHBGfx allocated from the console's display setting, asked for
+//     at runtime rather than assumed — see the note by pixPerFrame.
 //   - four pixel-shader modes rotate every 8 s:
 //       A) flat colour            -> raw ROP fill rate (R7xx theoretical: 4.4 Gpix/s)
 //       B) 1 bilinear tap, LINEAR -> cost of the "convenient" texture layout
@@ -34,8 +36,6 @@
 #include "crema_shader.h"
 
 #define OVERDRAW 32
-#define TV_W 1280.0
-#define TV_H 720.0
 #define MODE_SECONDS 8
 
 static const char *VS_SRC =
@@ -210,7 +210,21 @@ int main(int argc, char **argv)
 
     GX2SetSwapInterval(0);
 
-    const double pixPerFrame = TV_W * TV_H * OVERDRAW;
+    // Asked, not assumed — and it was assumed from the day this was written.
+    // The triangle is a
+    // fullscreen one in clip space, so it covers whatever WHBGfx allocated,
+    // and WHBGfx allocates from the console's own display setting: 1280x720
+    // on a console set to 720p and 1920x1080 on one set to 1080p. Two
+    // hard-coded numbers up here quietly divided every figure this benchmark
+    // has ever published by 2.25.
+    const GX2ColorBuffer *tvBuffer = WHBGfxGetTVColourBuffer();
+    const double tvW = tvBuffer ? (double)tvBuffer->surface.width : 1280.0;
+    const double tvH = tvBuffer ? (double)tvBuffer->surface.height : 720.0;
+    // The two clears per frame (TV plus the GamePad's) are NOT counted, so
+    // whatever comes out is if anything a floor rather than a ceiling.
+    const double pixPerFrame = tvW * tvH * OVERDRAW;
+    WHBLogPrintf("[fill] measuring into %.0fx%.0f at %dx overdraw = %.1f Mpix "
+                 "per frame", tvW, tvH, OVERDRAW, pixPerFrame / 1e6);
     int mode = 0;
     uint64_t modeStart = OSGetSystemTime();
     uint64_t t0 = modeStart;

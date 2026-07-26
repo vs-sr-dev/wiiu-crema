@@ -14,13 +14,41 @@
 // output of this PoC is not the game. It is the list of things I had to reach
 // back into PoC 11 for, each of which is now a candidate for extraction:
 //
-//   - the HUD list builder and the shader that draws it
-//   - the billboard shader that draws a CremaEffect
-//   - a per-entity velocity, which CremaEntity does not carry
+//   - the HUD list builder and the shader that draws it        [extracted]
+//   - the billboard shader that draws a CremaEffect            [extracted]
+//   - a per-entity velocity, which CremaEntity does not carry  [still here]
 //
-// The game itself is deliberately small and unpolished. Its job is to make the
-// scaffolding every game needs — states, pause, restart, a score that survives
-// a death — exist somewhere other than in a plan.
+// --- and then it was the witness, not the writer -----------------------------
+//
+// This file's four game states used to be a `switch` on an `int`. On 2026-07-26
+// they became four CremaScenes, and the rewrite is the whole reason `crema_scene`
+// is allowed to exist: PoC 13 discovered that shape while writing a role-playing
+// game, and a shape one example likes is not a shape, it is a preference. What
+// makes this file the test is that its four states were written months before
+// there was any such thing to fit them to.
+//
+// Three things were learned by fitting them, and all three are visible here:
+//
+//   1. `enter` and `leave` are not only about memory. The pause ducks the music
+//      on the way in and lifts it on the way out, which used to be two lines
+//      sitting at opposite ends of a `switch` with nothing saying they were a
+//      pair. Now they cannot drift apart.
+//
+//   2. The readout and the announcement are different lists. The score, the
+//      record and the lives belong to the round; "PAUSED" and "GAME OVER"
+//      belong to the thing on top of it. They used to be one `buildHud` with a
+//      `switch` at the bottom, and splitting them was not tidying — an overlay
+//      owns its own uniform slice because both lists are in flight at once.
+//
+//   3. What keeps moving under an overlay is the game's call, not the
+//      framework's. A suspended scene is suspended completely, so the pause
+//      freezes the explosions for free — and the game-over screen, which wants
+//      them to finish burning, ticks them itself from on top. That is one line
+//      in `overUpdate`, and it is *better* than the `if (state != PAUSED)` it
+//      replaced, which had to name the state it was not.
+//
+// What did NOT have to change is the part worth reporting: `crema_scene.h` was
+// not edited to make this file fit.
 
 #include <gx2/draw.h>
 #include <gx2/registers.h>
@@ -45,19 +73,16 @@
 #include "crema_effect.h"
 #include "crema_entity.h"
 #include "crema_frame.h"
+#include "crema_hud.h"
 #include "crema_input.h"
 #include "crema_matrix.h"
 #include "crema_mesh.h"
 #include "crema_music.h"
 #include "crema_pak.h"
 #include "crema_save.h"
+#include "crema_scene.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
-
-// The first extraction this PoC caused. It lived in PoC 11 until a second
-// example wanted it unchanged, which is the whole test — and it passed without
-// a line being edited, because it never knew what a Wii U was to begin with.
-#include "crema_hud.h"
 
 // --- the playfield -----------------------------------------------------------
 //
@@ -176,9 +201,11 @@ typedef struct {
 
 // --- the record --------------------------------------------------------------
 //
-// The one part of this game that is supposed to outlive the process. It was in
-// RAM until now, which meant the "BEST" line on the HUD was a lie the moment you
-// pressed HOME — it said "best" and meant "best since you turned it on".
+// The one part of this game that is supposed to outlive the process, and — now
+// that a round is a scene with a lifetime — also the one part that outlives the
+// round. It belongs to the application, beside the mesh and the sound bank,
+// which is exactly the line the scene rewrite drew: the score is the round's,
+// the record is the game's.
 //
 // Two fields rather than one on purpose. A high score alone would be indistinct
 // from a single word written to a file, and the thing worth proving is that a
@@ -193,11 +220,68 @@ typedef struct {
     uint32_t games;
 } Record;
 
-// --- the game ----------------------------------------------------------------
+// --- what the game adds to a scene -------------------------------------------
 
-enum { STATE_TITLE, STATE_PLAY, STATE_PAUSED, STATE_OVER };
+typedef struct Shmup Shmup;
 
 typedef struct {
+    CremaScene  base;
+    Shmup      *app;
+} SceneBase;
+
+static inline Shmup *sceneApp(CremaScene *self)
+{
+    return ((SceneBase *)self)->app;
+}
+
+// --- everything that outlives a round ----------------------------------------
+
+struct Shmup {
+    CremaShader *shShip;
+    CremaMesh    ship;
+    GX2Texture   hull, font;
+    GX2Sampler   sampler;
+
+    CremaEffectRenderer fxRenderer;
+    CremaHudRenderer    hudRenderer;
+
+    CremaBank    bank;
+    CremaMusic  *music;
+    const CremaInstrument *laser, *boom;
+
+    int32_t  gVs, gPs, instLoc;
+    uint32_t hullUnit;
+
+    // The camera never moves. A shoot-'em-up is a 3D scene photographed from
+    // one place forever, and every frame it does not recompute is a frame that
+    // cannot be wrong.
+    Mat4  viewProj;
+    float camPitch;
+    Vec3  lightDir;
+
+    Record record;
+    bool   canSave;
+
+    CremaSceneStack stack;
+    CremaScene     *stackStorage[3];
+    CremaScene *title, *play, *pause, *over;
+};
+
+static uint32_t rngState = 0x1234567u;
+
+static float randUnit(void)
+{
+    rngState = rngState * 1664525u + 1013904223u;
+    return (float)((rngState >> 8) & 0xFFFF) / 65535.0f;
+}
+
+// =============================================================================
+//  PLAY — the round, and the only scene here that owns anything
+// =============================================================================
+
+typedef struct {
+    SceneBase       b;
+
     CremaEntityPool pool;
     CremaEntity     storage[MAX_ENTITIES];
 
@@ -212,30 +296,29 @@ typedef struct {
     CremaEffectPool fx;
     CremaEffect     fxStorage[MAX_EFFECTS];
 
-    int      state;
-    uint32_t score, best, games;
+    uint32_t score;
     int      lives;
     float    invuln;         // after a death: visible, blinking, unhittable
     float    fireCooldown;
     float    waveTimer;
     uint32_t wave;
-    float    stateTime;
-} Game;
+    float    t;
 
-static uint32_t rngState = 0x1234567u;
+    // The uniform rings, which used to be created once in main and are now the
+    // round's own — because the pause and the game-over screen fill their own
+    // lists in the same frame this one is being drawn from.
+    CremaUniformRing globals, instances, fxViews, effects, hudRing;
+    const void *globalUbo, *instUbo, *fxViewUbo, *fxUbo, *hudUbo;
+    size_t      instBytes;
+    uint32_t    instCount, fxCount, hudCount;
+} PlayScene;
 
-static float randUnit(void)
-{
-    rngState = rngState * 1664525u + 1013904223u;
-    return (float)((rngState >> 8) & 0xFFFF) / 65535.0f;
-}
-
-static int slotOf(const Game *g, const CremaEntity *e)
+static int slotOf(const PlayScene *g, const CremaEntity *e)
 {
     return (int)(e - g->pool.items);
 }
 
-static CremaEntity *spawn(Game *g, uint32_t kind, Vec3 pos, Vec3 vel,
+static CremaEntity *spawn(PlayScene *g, uint32_t kind, Vec3 pos, Vec3 vel,
                           float radius, float ttl)
 {
     CremaEntity *e = CremaEntitySpawn(&g->pool, kind);
@@ -252,7 +335,7 @@ static CremaEntity *spawn(Game *g, uint32_t kind, Vec3 pos, Vec3 vel,
     return e;
 }
 
-static void burst(Game *g, Vec3 at, float size, float r, float gr, float b)
+static void burst(PlayScene *g, Vec3 at, float size, float r, float gr, float b)
 {
     CremaEffectSpawn(&g->fx, at, 0.45f, size, size * 3.0f, r, gr, b, 1.0f);
     for (int i = 0; i < 4; i++) {
@@ -263,42 +346,23 @@ static void burst(Game *g, Vec3 at, float size, float r, float gr, float b)
     }
 }
 
-static void resetRound(Game *g)
-{
-    CremaEntityClear(&g->pool);
-    memset(g->vel, 0, sizeof(g->vel));
-    memset(g->ttl, 0, sizeof(g->ttl));
-    g->score = 0;
-    g->lives = START_LIVES;
-    g->invuln = INVULN_TIME;
-    g->fireCooldown = 0.0f;
-    g->waveTimer = 0.6f;
-    g->wave = 0;
-
-    Vec3 start = { 0.0f, 0.0f, FIELD_NEAR - 4.0f };
-    Vec3 still = { 0.0f, 0.0f, 0.0f };
-    spawn(g, KIND_PLAYER, start, still, PLAYER_RADIUS, 0.0f);
-}
-
 // Written once per game over, and timed because a file on the SD card is the
-// slowest thing this program does on purpose and it happens while a frame is in
-// flight. If it costs milliseconds it belongs on another thread; if it costs
-// microseconds the simplest possible code is also the right one, and the only
-// way to know which is to print the number.
-static void persistRecord(Game *g)
+// slowest thing this program does on purpose. PoC 13 later found out how slow:
+// 42 ms on real hardware and 209 ms once, against the 1.1 ms Cemu reports. This
+// game gets away with it only because it saves at a game over, when the picture
+// has already stopped — see the note in the README.
+static void persistRecord(Shmup *app)
 {
-    Record rec;
-    rec.best  = g->best;
-    rec.games = g->games;
-
     uint64_t before = OSGetSystemTime();
-    bool ok = CremaSaveWrite(RECORD_FILE, RECORD_VERSION, &rec, sizeof(rec));
+    bool ok = CremaSaveWrite(RECORD_FILE, RECORD_VERSION, &app->record,
+                             sizeof(app->record));
     uint32_t us = (uint32_t)OSTicksToMicroseconds(OSGetSystemTime() - before);
     WHBLogPrintf("[poc12] record %s: best %u, %u games, %u us",
-                 ok ? "saved" : "NOT saved", rec.best, rec.games, us);
+                 ok ? "saved" : "NOT saved", app->record.best,
+                 app->record.games, us);
 }
 
-static CremaEntity *findPlayer(Game *g)
+static CremaEntity *findPlayer(PlayScene *g)
 {
     for (uint32_t i = 0; i < g->pool.watermark; i++)
         if (g->pool.items[i].active && g->pool.items[i].kind == KIND_PLAYER)
@@ -308,7 +372,7 @@ static CremaEntity *findPlayer(Game *g)
 
 // A wave is a row of ships entering together with a shared sway. Difficulty is
 // one number growing: they come sooner, faster, and shoot more often.
-static uint32_t countKind(const Game *g, uint32_t kind)
+static uint32_t countKind(const PlayScene *g, uint32_t kind)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < g->pool.watermark; i++)
@@ -317,7 +381,7 @@ static uint32_t countKind(const Game *g, uint32_t kind)
     return n;
 }
 
-static void launchWave(Game *g)
+static void launchWave(PlayScene *g)
 {
     g->wave++;
     float hard = 1.0f + (float)g->wave * 0.06f;
@@ -336,12 +400,73 @@ static void launchWave(Game *g)
     if (g->waveTimer < 0.5f) g->waveTimer = 0.5f;
 }
 
-typedef struct {
-    const CremaInstrument *laser, *boom;
-} Sfx;
-
-static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
+// What used to be `resetRound`, and it did not have to be rewritten — it had
+// always been an `enter`, it just had nowhere to be called from that said so.
+static void playEnter(CremaScene *self)
 {
+    PlayScene *g = (PlayScene *)self;
+
+    CremaUniformRingCreate(&g->globals,   sizeof(GlobalBlock),
+                           CREMA_FRAMES_IN_FLIGHT);
+    g->instBytes = sizeof(float) * 4 * 2 * MAX_INSTANCES;
+    CremaUniformRingCreate(&g->instances, g->instBytes, CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&g->fxViews,   sizeof(CremaEffectView),
+                           CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&g->effects,   CREMA_EFFECT_BLOCK_BYTES,
+                           CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&g->hudRing,   CREMA_HUD_BLOCK_BYTES,
+                           CREMA_FRAMES_IN_FLIGHT);
+
+    CremaEntityPoolInit(&g->pool, g->storage, MAX_ENTITIES);
+    CremaEffectPoolInit(&g->fx, g->fxStorage, MAX_EFFECTS);
+    memset(g->vel, 0, sizeof(g->vel));
+    memset(g->ttl, 0, sizeof(g->ttl));
+    g->score = 0;
+    g->lives = START_LIVES;
+    g->invuln = INVULN_TIME;
+    g->fireCooldown = 0.0f;
+    g->waveTimer = 0.6f;
+    g->wave = 0;
+    g->t = 0.0f;
+
+    Vec3 start = { 0.0f, 0.0f, FIELD_NEAR - 4.0f };
+    Vec3 still = { 0.0f, 0.0f, 0.0f };
+    spawn(g, KIND_PLAYER, start, still, PLAYER_RADIUS, 0.0f);
+
+    CremaMusicSetVolume(sceneApp(self)->music, 1.0f);
+}
+
+static void playLeave(CremaScene *self)
+{
+    PlayScene *g = (PlayScene *)self;
+    CremaUniformRingDestroy(&g->globals);
+    CremaUniformRingDestroy(&g->instances);
+    CremaUniformRingDestroy(&g->fxViews);
+    CremaUniformRingDestroy(&g->effects);
+    CremaUniformRingDestroy(&g->hudRing);
+
+    // Emptied, and not because anything reads it afterwards: the once-a-second
+    // log line does, and on the title screen it was still reporting the entities
+    // and the score of the round that had just ended. A leftover in a struct is
+    // harmless; a leftover in a log is a lie, and this project has found more
+    // than one real bug by believing that line.
+    CremaEntityClear(&g->pool);
+    g->score = 0;
+    g->lives = 0;
+    g->instCount = g->fxCount = g->hudCount = 0;
+}
+
+static void playUpdate(CremaScene *self, const CremaInput *in, float dt)
+{
+    PlayScene *g = (PlayScene *)self;
+    Shmup *app = sceneApp(self);
+    g->t += dt;
+
+    if (CremaInputPressed(in, VPAD_BUTTON_PLUS)) {
+        CremaSceneRequest(&app->stack, CREMA_SCENE_PUSH, app->pause);
+        return;
+    }
+
     CremaEntity *player = findPlayer(g);
 
     if (g->invuln > 0.0f)
@@ -364,8 +489,8 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
             Vec3 v = { 0.0f, 0.0f, -SHOT_SPEED };
             if (spawn(g, KIND_SHOT, muzzle, v, SHOT_RADIUS, 1.4f)) {
                 g->fireCooldown = FIRE_INTERVAL;
-                if (sfx->laser)
-                    CremaAudioPlay(&sfx->laser->sound, 0.55f,
+                if (app->laser)
+                    CremaAudioPlay(&app->laser->sound, 0.55f,
                                    1.05f + randUnit() * 0.10f);
             }
         }
@@ -381,8 +506,8 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
         e->pos.z += g->vel[i].z * dt;
 
         if (e->kind == KIND_ENEMY) {
-            e->pos.x += sinf(g->stateTime * 1.7f + (float)i) * 9.0f * dt;
-            e->roll   = sinf(g->stateTime * 1.7f + (float)i) * 0.4f;
+            e->pos.x += sinf(g->t * 1.7f + (float)i) * 9.0f * dt;
+            e->roll   = sinf(g->t * 1.7f + (float)i) * 0.4f;
             // shooting is a die roll per second, not a timer per enemy: one
             // number, and it scales with the wave without any bookkeeping
             if (player && randUnit() < 0.35f * dt * (1.0f + g->wave * 0.05f)) {
@@ -416,8 +541,8 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
                                        foe->pos, foe->radius))
                 continue;
             burst(g, foe->pos, 2.4f, 1.0f, 0.62f, 0.20f);
-            if (sfx->boom)
-                CremaAudioPlay(&sfx->boom->sound, 0.75f,
+            if (app->boom)
+                CremaAudioPlay(&app->boom->sound, 0.75f,
                                1.15f + randUnit() * 0.2f);
             CremaEntityDespawn(&g->pool, foe);
             CremaEntityDespawn(&g->pool, shot);
@@ -438,21 +563,23 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
                 continue;
 
             burst(g, player->pos, 3.4f, 0.55f, 0.75f, 1.0f);
-            if (sfx->boom)
-                CremaAudioPlay(&sfx->boom->sound, 1.0f, 0.72f);
+            if (app->boom)
+                CremaAudioPlay(&app->boom->sound, 1.0f, 0.72f);
             CremaEntityDespawn(&g->pool, threat);
             g->lives--;
             if (g->lives <= 0) {
                 CremaEntityDespawn(&g->pool, player);
-                if (g->score > g->best)
-                    g->best = g->score;
-                g->games++;
+                if (g->score > app->record.best)
+                    app->record.best = g->score;
+                app->record.games++;
                 // Here and nowhere else. A game that saved every time the score
                 // changed would write to the card a hundred times a minute for
                 // one number that only matters when the round is over.
-                persistRecord(g);
-                g->state = STATE_OVER;
-                g->stateTime = 0.0f;
+                persistRecord(app);
+                // A push and not a goto: the round stays alive underneath, so
+                // the wreck you died in is what you read your score over — and
+                // nothing had to be copied out of it first.
+                CremaSceneRequest(&app->stack, CREMA_SCENE_PUSH, app->over);
             } else {
                 g->invuln = INVULN_TIME;
                 player->pos.x = 0.0f;
@@ -461,6 +588,8 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
             break;
         }
     }
+
+    CremaEffectUpdate(&g->fx, dt);
 
     g->waveTimer -= dt;
     if (g->waveTimer <= 0.0f) {
@@ -475,46 +604,7 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
     }
 }
 
-// --- rendering ---------------------------------------------------------------
-
-typedef struct {
-    const CremaShader *shShip;
-    const CremaMesh   *mesh;
-    const GX2Texture  *hull, *font;
-    const GX2Sampler  *sampler;
-    uint32_t hullUnit;
-    int32_t  gVs, gPs, instLoc;
-    const void *globalUbo, *instUbo, *fxViewUbo, *fxUbo, *hudUbo;
-    size_t   instBytes;
-    uint32_t instCount, fxCount, hudCount;
-
-    // The two renderers that used to be spelled out here. What is left in this
-    // file is the one shader this game actually invented.
-    const CremaEffectRenderer *fxRenderer;
-    const CremaHudRenderer    *hudRenderer;
-} View;
-
-static void drawWorld(void *user)
-{
-    const View *v = (const View *)user;
-
-    if (v->instCount > 0) {
-        CremaDepthSet(true, true);
-        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, TRUE);
-        CremaShaderBind(v->shShip);
-        GX2SetVertexUniformBlock(v->gVs, sizeof(GlobalBlock), v->globalUbo);
-        GX2SetPixelUniformBlock(v->gPs, sizeof(GlobalBlock), v->globalUbo);
-        GX2SetVertexUniformBlock(v->instLoc, v->instBytes, v->instUbo);
-        GX2SetPixelTexture(v->hull, v->hullUnit);
-        GX2SetPixelSampler(v->sampler, v->hullUnit);
-        CremaMeshDraw(v->mesh, v->instCount);
-    }
-
-    CremaEffectDraw(v->fxRenderer, v->fxViewUbo, v->fxUbo, v->fxCount);
-    CremaHudDraw(v->hudRenderer, v->hudUbo, v->hudCount, v->font, v->sampler);
-}
-
-static uint32_t packInstances(const Game *g, float (*out)[4], uint32_t max)
+static uint32_t packInstances(const PlayScene *g, float (*out)[4], uint32_t max)
 {
     uint32_t n = 0;
     for (uint32_t i = 0; i < g->pool.watermark && n < max; i++) {
@@ -558,51 +648,282 @@ static uint32_t packInstances(const Game *g, float (*out)[4], uint32_t max)
     return n;
 }
 
-static void buildHud(const Game *g, HudList *hud)
+// The readout, and nothing else. What used to follow it — a `switch` painting
+// "PAUSED" or "GAME OVER" — now belongs to whichever scene is on top, which is
+// the same split the uniform rings had to make.
+static void playHud(const PlayScene *g, HudList *h)
 {
-    hudClear(hud);
-    hudText(hud, 40.0f, 34.0f, 22.0f, "SCORE", 0.62f, 0.78f, 0.95f, 0.9f);
-    hudNumber(hud, 140.0f, 34.0f, 22.0f, g->score, 6, 1.0f, 1.0f, 1.0f, 1.0f);
+    const Shmup *app = g->b.app;
+    hudClear(h);
+    hudText(h, 40.0f, 34.0f, 22.0f, "SCORE", 0.62f, 0.78f, 0.95f, 0.9f);
+    hudNumber(h, 140.0f, 34.0f, 22.0f, g->score, 6, 1.0f, 1.0f, 1.0f, 1.0f);
 
-    hudText(hud, 40.0f, 66.0f, 16.0f, "BEST", 0.45f, 0.55f, 0.70f, 0.8f);
-    hudNumber(hud, 112.0f, 66.0f, 16.0f, g->best, 6, 0.65f, 0.75f, 0.9f, 0.8f);
+    hudText(h, 40.0f, 66.0f, 16.0f, "BEST", 0.45f, 0.55f, 0.70f, 0.8f);
+    hudNumber(h, 112.0f, 66.0f, 16.0f, app->record.best, 6,
+              0.65f, 0.75f, 0.9f, 0.8f);
 
     for (int i = 0; i < g->lives; i++)
-        hudRect(hud, 1180.0f - (float)i * 26.0f, 38.0f, 16.0f, 16.0f,
+        hudRect(h, 1180.0f - (float)i * 26.0f, 38.0f, 16.0f, 16.0f,
                 0.75f, 0.90f, 1.0f, 0.95f);
-
-    switch (g->state) {
-    case STATE_TITLE:
-        hudText(hud, 430.0f, 250.0f, 54.0f, "CREMA", 1.0f, 0.85f, 0.45f, 1.0f);
-        hudText(hud, 430.0f, 312.0f, 30.0f, "SQUADRON", 0.85f, 0.92f, 1.0f, 0.95f);
-        // blinking, because a static prompt reads as a label and a blinking one
-        // reads as an invitation
-        if (fmodf(g->stateTime, 1.0f) < 0.6f)
-            hudText(hud, 470.0f, 430.0f, 24.0f, "PRESS A", 0.9f, 0.9f, 0.9f, 1.0f);
-        // The proof that the save worked, and the reason it is on the title
-        // screen: a number that is not zero on a fresh boot came from a file.
-        hudText(hud, 500.0f, 520.0f, 18.0f, "GAMES", 0.5f, 0.6f, 0.75f, 0.85f);
-        hudNumber(hud, 580.0f, 520.0f, 18.0f, g->games, 4,
-                  0.7f, 0.8f, 0.95f, 0.85f);
-        break;
-    case STATE_PAUSED:
-        hudRect(hud, 0.0f, 300.0f, 1280.0f, 120.0f, 0.0f, 0.0f, 0.0f, 0.55f);
-        hudText(hud, 530.0f, 330.0f, 40.0f, "PAUSED", 1.0f, 1.0f, 1.0f, 1.0f);
-        break;
-    case STATE_OVER:
-        hudRect(hud, 0.0f, 260.0f, 1280.0f, 210.0f, 0.0f, 0.0f, 0.0f, 0.6f);
-        hudText(hud, 470.0f, 290.0f, 44.0f, "GAME OVER", 1.0f, 0.45f, 0.38f, 1.0f);
-        hudText(hud, 480.0f, 356.0f, 24.0f, "SCORE", 0.8f, 0.8f, 0.9f, 1.0f);
-        hudNumber(hud, 610.0f, 356.0f, 24.0f, g->score, 6, 1.0f, 1.0f, 1.0f, 1.0f);
-        if (g->stateTime > 1.0f && fmodf(g->stateTime, 1.0f) < 0.6f)
-            hudText(hud, 455.0f, 412.0f, 22.0f, "PRESS A", 0.9f, 0.9f, 0.9f, 1.0f);
-        break;
-    default:
-        break;
-    }
 }
 
-// --- main --------------------------------------------------------------------
+static void playBuild(CremaScene *self, uint32_t slot)
+{
+    PlayScene *g = (PlayScene *)self;
+    Shmup *app = sceneApp(self);
+
+    GlobalBlock blk;
+    blk.viewProj = app->viewProj;
+    blk.lightDir[0] = app->lightDir.x; blk.lightDir[1] = app->lightDir.y;
+    blk.lightDir[2] = app->lightDir.z; blk.lightDir[3] = 0.0f;
+    blk.time[0] = g->t;
+    blk.time[1] = blk.time[2] = blk.time[3] = 0.0f;
+    g->globalUbo = CremaUniformRingStore(&g->globals, slot, &blk, sizeof(blk));
+
+    // The billboards ask for three numbers of their own rather than reading
+    // this game's Global block, which is what lets the same renderer serve
+    // a shooter whose camera never moves and a flight demo whose camera
+    // never stops. The camera here being fixed, its basis is a constant.
+    CremaEffectView fxView;
+    fxView.viewProj = app->viewProj;
+    fxView.camRight[0] = 1.0f; fxView.camRight[1] = 0.0f;
+    fxView.camRight[2] = 0.0f; fxView.camRight[3] = 0.0f;
+    fxView.camUp[0] = 0.0f;    fxView.camUp[1] = cosf(app->camPitch);
+    fxView.camUp[2] = -sinf(app->camPitch); fxView.camUp[3] = 0.0f;
+    g->fxViewUbo = CremaUniformRingStore(&g->fxViews, slot, &fxView,
+                                         sizeof(fxView));
+
+    static float instData[MAX_INSTANCES * 2][4];
+    static float fxData[MAX_EFFECTS * 2][4];
+    static HudList hud;
+
+    g->instCount = packInstances(g, instData, MAX_INSTANCES);
+    g->instUbo   = CremaUniformRingStore(&g->instances, slot, instData,
+                                         g->instBytes);
+    g->fxCount   = CremaEffectPack(&g->fx, fxData, MAX_EFFECTS);
+    g->fxUbo     = CremaUniformRingStore(&g->effects, slot, fxData,
+                                         CREMA_EFFECT_BLOCK_BYTES);
+
+    playHud(g, &hud);
+    g->hudCount = hud.count;
+    g->hudUbo   = CremaUniformRingStore(&g->hudRing, slot, hud.items,
+                                        CREMA_HUD_BLOCK_BYTES);
+}
+
+static void playDraw(CremaScene *self)
+{
+    PlayScene *g = (PlayScene *)self;
+    const Shmup *app = sceneApp(self);
+
+    if (g->instCount > 0) {
+        CremaDepthSet(true, true);
+        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, TRUE);
+        CremaShaderBind(app->shShip);
+        GX2SetVertexUniformBlock(app->gVs, sizeof(GlobalBlock), g->globalUbo);
+        GX2SetPixelUniformBlock(app->gPs, sizeof(GlobalBlock), g->globalUbo);
+        GX2SetVertexUniformBlock(app->instLoc, g->instBytes, g->instUbo);
+        GX2SetPixelTexture(&app->hull, app->hullUnit);
+        GX2SetPixelSampler(&app->sampler, app->hullUnit);
+        CremaMeshDraw(&app->ship, g->instCount);
+    }
+
+    CremaEffectDraw(&app->fxRenderer, g->fxViewUbo, g->fxUbo, g->fxCount);
+    if (g->hudCount > 0)
+        CremaHudDraw(&app->hudRenderer, g->hudUbo, g->hudCount,
+                     &app->font, &app->sampler);
+}
+
+// =============================================================================
+//  The three scenes that are only words
+// =============================================================================
+//
+// A title screen, a pause and a game over, and between them they own one
+// uniform ring each and nothing else. Entering one is microseconds — which is
+// the measurement that says an overlay may be pushed freely and a place may
+// not.
+
+typedef struct {
+    SceneBase        b;
+    CremaUniformRing hudRing;
+    HudList          list;
+    const void      *hudUbo;
+    uint32_t         hudCount;
+    float            t;
+    PlayScene       *round;      // only the game-over screen uses it
+} WordsScene;
+
+static void wordsEnter(CremaScene *self)
+{
+    WordsScene *s = (WordsScene *)self;
+    CremaUniformRingCreate(&s->hudRing, CREMA_HUD_BLOCK_BYTES,
+                           CREMA_FRAMES_IN_FLIGHT);
+    s->t = 0.0f;
+}
+
+static void wordsLeave(CremaScene *self)
+{
+    CremaUniformRingDestroy(&((WordsScene *)self)->hudRing);
+}
+
+static void wordsStore(WordsScene *s, uint32_t slot)
+{
+    s->hudCount = s->list.count;
+    s->hudUbo   = CremaUniformRingStore(&s->hudRing, slot, s->list.items,
+                                        CREMA_HUD_BLOCK_BYTES);
+}
+
+static void wordsDraw(CremaScene *self)
+{
+    WordsScene *s = (WordsScene *)self;
+    const Shmup *app = sceneApp(self);
+    if (s->hudCount > 0)
+        CremaHudDraw(&app->hudRenderer, s->hudUbo, s->hudCount,
+                     &app->font, &app->sampler);
+}
+
+// --- title -------------------------------------------------------------------
+
+static void titleEnter(CremaScene *self)
+{
+    wordsEnter(self);
+    CremaMusicSetVolume(sceneApp(self)->music, 0.7f);
+}
+
+static void titleUpdate(CremaScene *self, const CremaInput *in, float dt)
+{
+    WordsScene *s = (WordsScene *)self;
+    s->t += dt;
+    if (CremaInputPressed(in, VPAD_BUTTON_A))
+        CremaSceneRequest(&sceneApp(self)->stack, CREMA_SCENE_GOTO,
+                          sceneApp(self)->play);
+}
+
+static void titleBuild(CremaScene *self, uint32_t slot)
+{
+    WordsScene *s = (WordsScene *)self;
+    const Shmup *app = sceneApp(self);
+    HudList *h = &s->list;
+    hudClear(h);
+    hudText(h, 430.0f, 250.0f, 54.0f, "CREMA", 1.0f, 0.85f, 0.45f, 1.0f);
+    hudText(h, 430.0f, 312.0f, 30.0f, "SQUADRON", 0.85f, 0.92f, 1.0f, 0.95f);
+    // blinking, because a static prompt reads as a label and a blinking one
+    // reads as an invitation
+    if (fmodf(s->t, 1.0f) < 0.6f)
+        hudText(h, 470.0f, 430.0f, 24.0f, "PRESS A", 0.9f, 0.9f, 0.9f, 1.0f);
+    hudText(h, 470.0f, 490.0f, 18.0f, "BEST", 0.5f, 0.6f, 0.75f, 0.85f);
+    hudNumber(h, 550.0f, 490.0f, 18.0f, app->record.best, 6,
+              0.7f, 0.8f, 0.95f, 0.85f);
+    // The proof that the save worked, and the reason it is on the title
+    // screen: a number that is not zero on a fresh boot came from a file.
+    hudText(h, 500.0f, 520.0f, 18.0f, "GAMES", 0.5f, 0.6f, 0.75f, 0.85f);
+    hudNumber(h, 580.0f, 520.0f, 18.0f, app->record.games, 4,
+              0.7f, 0.8f, 0.95f, 0.85f);
+    wordsStore(s, slot);
+}
+
+// --- pause -------------------------------------------------------------------
+//
+// The two lines that used to be at opposite ends of a `switch`, now a pair.
+
+static void pauseEnter(CremaScene *self)
+{
+    wordsEnter(self);
+    CremaMusicSetVolume(sceneApp(self)->music, 0.35f);
+}
+
+static void pauseLeave(CremaScene *self)
+{
+    wordsLeave(self);
+    CremaMusicSetVolume(sceneApp(self)->music, 1.0f);
+}
+
+static void pauseUpdate(CremaScene *self, const CremaInput *in, float dt)
+{
+    WordsScene *s = (WordsScene *)self;
+    s->t += dt;
+    // Nothing else happens here, and that is the feature: the round underneath
+    // is suspended, so the explosions hold still without anybody saying so.
+    if (CremaInputPressed(in, VPAD_BUTTON_PLUS))
+        CremaSceneRequest(&sceneApp(self)->stack, CREMA_SCENE_POP, NULL);
+}
+
+static void pauseBuild(CremaScene *self, uint32_t slot)
+{
+    WordsScene *s = (WordsScene *)self;
+    HudList *h = &s->list;
+    hudClear(h);
+    hudRect(h, 0.0f, 300.0f, 1280.0f, 120.0f, 0.0f, 0.0f, 0.0f, 0.55f);
+    hudText(h, 530.0f, 330.0f, 40.0f, "PAUSED", 1.0f, 1.0f, 1.0f, 1.0f);
+    wordsStore(s, slot);
+}
+
+// --- game over ---------------------------------------------------------------
+
+static void overUpdate(CremaScene *self, const CremaInput *in, float dt)
+{
+    WordsScene *s = (WordsScene *)self;
+    s->t += dt;
+
+    // The one place this rewrite needed a decision rather than a move. A
+    // suspended scene is suspended completely, so the last explosion would
+    // freeze in the air — and this screen is the one place that wants it to
+    // finish. So the overlay ticks it, which is a line the game is entitled to
+    // write because the game owns both scenes. It replaces
+    // `if (state != STATE_PAUSED) CremaEffectUpdate(...)`, which had to name a
+    // state it was not in order to say the same thing.
+    if (s->round)
+        CremaEffectUpdate(&s->round->fx, dt);
+
+    // A second before the prompt appears. Nothing else moves, so the last
+    // explosion finishes burning over a scene frozen where it went wrong —
+    // which is the right thing to be looking at while you read your score.
+    if (s->t > 1.0f && CremaInputPressed(in, VPAD_BUTTON_A))
+        CremaSceneRequest(&sceneApp(self)->stack, CREMA_SCENE_GOTO,
+                          sceneApp(self)->title);
+}
+
+static void overBuild(CremaScene *self, uint32_t slot)
+{
+    WordsScene *s = (WordsScene *)self;
+    HudList *h = &s->list;
+    hudClear(h);
+    hudRect(h, 0.0f, 260.0f, 1280.0f, 210.0f, 0.0f, 0.0f, 0.0f, 0.6f);
+    hudText(h, 470.0f, 290.0f, 44.0f, "GAME OVER", 1.0f, 0.45f, 0.38f, 1.0f);
+    hudText(h, 480.0f, 356.0f, 24.0f, "SCORE", 0.8f, 0.8f, 0.9f, 1.0f);
+    hudNumber(h, 610.0f, 356.0f, 24.0f, s->round ? s->round->score : 0, 6,
+              1.0f, 1.0f, 1.0f, 1.0f);
+    if (s->t > 1.0f && fmodf(s->t, 1.0f) < 0.6f)
+        hudText(h, 455.0f, 412.0f, 22.0f, "PRESS A", 0.9f, 0.9f, 0.9f, 1.0f);
+    wordsStore(s, slot);
+}
+
+// =============================================================================
+//  wiring
+// =============================================================================
+
+static void sceneInit(SceneBase *sb, Shmup *app, const char *name, bool opaque,
+                      const float clear[4],
+                      void (*enter)(CremaScene *),
+                      void (*leave)(CremaScene *),
+                      void (*update)(CremaScene *, const CremaInput *, float),
+                      void (*build)(CremaScene *, uint32_t),
+                      void (*draw)(CremaScene *))
+{
+    memset(&sb->base, 0, sizeof(sb->base));
+    sb->app = app;
+    sb->base.name   = name;
+    sb->base.opaque = opaque;
+    memcpy(sb->base.clear, clear, sizeof(sb->base.clear));
+    sb->base.enter  = enter;
+    sb->base.leave  = leave;
+    sb->base.update = update;
+    sb->base.build  = build;
+    sb->base.draw   = draw;
+}
+
+static Shmup      app;
+static PlayScene  playScene;
+static WordsScene titleScene, pauseScene, overScene;
 
 int main(int argc, char **argv)
 {
@@ -611,21 +932,16 @@ int main(int argc, char **argv)
     if (!CremaAppInit("poc12-shmup"))
         return -1;
     CremaAudioInit();                  // before the assets: it ends the menu music
+    memset(&app, 0, sizeof(app));
     // Not fatal. A game that cannot find a card is a game with no record, and
-    // that is exactly how this PoC behaved yesterday.
-    bool canSave = CremaSaveInit("gx2poc");
+    // that is exactly how this PoC behaved before crema_save existed.
+    app.canSave = CremaSaveInit("gx2poc");
     if (!CremaShaderInitCompiler()) {
         CremaAppShutdown();
         return -1;
     }
 
-    CremaMesh   ship;
-    GX2Texture  hull, font;
-    CremaBank   bank;
-    CremaMusic *music = NULL;
-    memset(&bank, 0, sizeof(bank));
     bool ok = false;
-
     CremaPak pak;
     if (CremaPakOpen(&pak, "/vol/content/assets.cpak")) {
         size_t meshBytes = 0, hullBytes = 0, fontBytes = 0;
@@ -636,13 +952,13 @@ int main(int argc, char **argv)
         const void *bankBlob = CremaPakFind(&pak, "audio.cbank", &bankBytes);
         const void *songBlob = CremaPakFind(&pak, "theme.csong", &songBytes);
         ok = meshBlob && hullBlob && fontBlob &&
-             CremaMeshLoadFromMemory(&ship, meshBlob, meshBytes, "ship.cmesh") &&
-             CremaTextureLoadFromMemory(&hull, hullBlob, hullBytes, "hull.ctex") &&
-             CremaTextureLoadFromMemory(&font, fontBlob, fontBytes, "font.ctex");
+             CremaMeshLoadFromMemory(&app.ship, meshBlob, meshBytes, "ship.cmesh") &&
+             CremaTextureLoadFromMemory(&app.hull, hullBlob, hullBytes, "hull.ctex") &&
+             CremaTextureLoadFromMemory(&app.font, fontBlob, fontBytes, "font.ctex");
         // sound is not worth failing over: a silent game is still a game
-        if (ok && bankBlob && CremaBankLoadFromMemory(&bank, bankBlob, bankBytes)
-            && songBlob)
-            CremaMusicLoadFromMemory(&music, songBlob, songBytes, &bank);
+        if (ok && bankBlob &&
+            CremaBankLoadFromMemory(&app.bank, bankBlob, bankBytes) && songBlob)
+            CremaMusicLoadFromMemory(&app.music, songBlob, songBytes, &app.bank);
         CremaPakClose(&pak);
     }
     if (!ok) {
@@ -653,9 +969,8 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    Sfx sfx;
-    sfx.laser = CremaBankFind(&bank, "laser");
-    sfx.boom  = CremaBankFind(&bank, "boom");
+    app.laser = CremaBankFind(&app.bank, "laser");
+    app.boom  = CremaBankFind(&app.bank, "boom");
 
     // The mix has no idea how loud it is unless somebody decides: PoC 11 found
     // the same mix clipping at nearly twice full scale with everything at
@@ -663,13 +978,11 @@ int main(int argc, char **argv)
     CremaAudioSetHeadroom(0.40f);
 
     // The only shader this game had to write. The other two came with the
-    // framework, which is what the previous half hour of work bought.
-    CremaShader *shShip = CremaShaderCompile(VS_SHIP, PS_SHIP,
-                                             ship.attribs, ship.attribCount);
-    CremaEffectRenderer fxRenderer;
-    CremaHudRenderer    hudRenderer;
-    if (!shShip || !CremaEffectRendererCreate(&fxRenderer) ||
-        !CremaHudRendererCreate(&hudRenderer)) {
+    // framework, which is what an earlier half hour of work bought.
+    app.shShip = CremaShaderCompile(VS_SHIP, PS_SHIP,
+                                    app.ship.attribs, app.ship.attribCount);
+    if (!app.shShip || !CremaEffectRendererCreate(&app.fxRenderer) ||
+        !CremaHudRendererCreate(&app.hudRenderer)) {
         WHBLogPrintf("[poc12] shader compile failed");
         CremaShaderShutdownCompiler();
         CremaAudioShutdown();
@@ -677,52 +990,35 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    GX2Sampler sampler;
-    CremaSamplerInitTrilinear(&sampler, GX2_TEX_CLAMP_MODE_WRAP);
+    CremaSamplerInitTrilinear(&app.sampler, GX2_TEX_CLAMP_MODE_WRAP);
 
-    View view;
-    memset(&view, 0, sizeof(view));
-    view.shShip = shShip;
-    view.mesh = &ship;      view.hull = &hull;  view.font = &font;
-    view.sampler = &sampler;
-    view.fxRenderer  = &fxRenderer;
-    view.hudRenderer = &hudRenderer;
-    view.gVs     = CremaShaderVSBlockLocation(shShip, "Global");
-    view.gPs     = CremaShaderPSBlockLocation(shShip, "Global");
-    view.instLoc = CremaShaderVSBlockLocation(shShip, "Instances");
-    if (view.gVs < 0)     view.gVs = 0;
-    if (view.gPs < 0)     view.gPs = 0;
-    if (view.instLoc < 0) view.instLoc = 1;
-    if (shShip->ps->samplerVarCount > 0)
-        view.hullUnit = shShip->ps->samplerVars[0].location;
+    app.gVs     = CremaShaderVSBlockLocation(app.shShip, "Global");
+    app.gPs     = CremaShaderPSBlockLocation(app.shShip, "Global");
+    app.instLoc = CremaShaderVSBlockLocation(app.shShip, "Instances");
+    if (app.gVs     < 0) app.gVs     = 0;
+    if (app.gPs     < 0) app.gPs     = 0;
+    if (app.instLoc < 0) app.instLoc = 1;
+    if (app.shShip->ps->samplerVarCount > 0)
+        app.hullUnit = app.shShip->ps->samplerVars[0].location;
 
-    const size_t INST_BYTES = sizeof(float) * 4 * 2 * MAX_INSTANCES;
-    CremaUniformRing globals, instances, fxViews, effects, hudRing;
-    CremaUniformRingCreate(&globals,   sizeof(GlobalBlock), CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&instances, INST_BYTES, CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&fxViews,   sizeof(CremaEffectView),
-                           CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&effects,   CREMA_EFFECT_BLOCK_BYTES,
-                           CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&hudRing,   CREMA_HUD_BLOCK_BYTES,
-                           CREMA_FRAMES_IN_FLIGHT);
-    view.instBytes = INST_BYTES;
+    Vec3 camPos = { 0.0f, 42.0f, 34.0f };
+    app.camPitch = -0.82f;
+    Mat4 proj = mat4_perspective(58.0f * 3.14159265f / 180.0f,
+                                 16.0f / 9.0f, 0.5f, 260.0f);
+    Mat4 viewMat = mat4_mul(mat4_rotate_x(-app.camPitch),
+                            mat4_translate(-camPos.x, -camPos.y, -camPos.z));
+    app.viewProj = mat4_mul(proj, viewMat);
+    Vec3 lightRaw = { -0.35f, -0.80f, -0.48f };
+    app.lightDir = vec3_normalize(lightRaw);
 
-    static Game game;
-    memset(&game, 0, sizeof(game));
-    CremaEntityPoolInit(&game.pool, game.storage, MAX_ENTITIES);
-    CremaEffectPoolInit(&game.fx, game.fxStorage, MAX_EFFECTS);
-    game.state = STATE_TITLE;
-
-    if (canSave) {
+    if (app.canSave) {
         Record rec;
         uint64_t before = OSGetSystemTime();
         size_t got = CremaSaveRead(RECORD_FILE, RECORD_VERSION,
                                    &rec, sizeof(rec));
         uint32_t us = (uint32_t)OSTicksToMicroseconds(OSGetSystemTime() - before);
         if (got == sizeof(rec)) {
-            game.best  = rec.best;
-            game.games = rec.games;
+            app.record = rec;
             WHBLogPrintf("[poc12] record loaded from %s: best %u after %u "
                          "games, %u us", CremaSaveDir(), rec.best, rec.games, us);
         } else {
@@ -731,25 +1027,30 @@ int main(int argc, char **argv)
         }
     }
 
-    // The camera never moves. A shoot-'em-up is a 3D scene photographed from
-    // one place forever, and every frame it does not recompute is a frame that
-    // cannot be wrong.
-    Vec3 camPos = { 0.0f, 42.0f, 34.0f };
-    float camPitch = -0.82f;
-    Mat4 proj = mat4_perspective(58.0f * 3.14159265f / 180.0f,
-                                 16.0f / 9.0f, 0.5f, 260.0f);
-    Mat4 viewMat = mat4_mul(mat4_rotate_x(-camPitch),
-                            mat4_translate(-camPos.x, -camPos.y, -camPos.z));
-    Mat4 viewProj = mat4_mul(proj, viewMat);
-    Vec3 lightRaw = { -0.35f, -0.80f, -0.48f };
-    Vec3 lightDir = vec3_normalize(lightRaw);
+    static const float SPACE[4] = { 0.03f, 0.05f, 0.09f, 1.0f };
 
-    static float instData[MAX_INSTANCES * 2][4];
-    static float fxData[MAX_EFFECTS * 2][4];
-    static HudList hud;
+    sceneInit(&titleScene.b, &app, "title", true, SPACE,
+              titleEnter, wordsLeave, titleUpdate, titleBuild, wordsDraw);
+    sceneInit(&playScene.b,  &app, "play",  true, SPACE,
+              playEnter, playLeave, playUpdate, playBuild, playDraw);
+    sceneInit(&pauseScene.b, &app, "pause", false, SPACE,
+              pauseEnter, pauseLeave, pauseUpdate, pauseBuild, wordsDraw);
+    sceneInit(&overScene.b,  &app, "over",  false, SPACE,
+              wordsEnter, wordsLeave, overUpdate, overBuild, wordsDraw);
+    // The game-over screen reads the round's score from underneath. It did not
+    // need anything from crema_scene to do it: the stack guarantees the round is
+    // still alive, and this file already had a typed pointer to it.
+    overScene.round = &playScene;
 
-    if (music)
-        CremaMusicStart(music);
+    CremaSceneStackInit(&app.stack, app.stackStorage,
+                        sizeof(app.stackStorage) / sizeof(app.stackStorage[0]));
+    app.title = &titleScene.b.base;
+    app.play  = &playScene.b.base;
+    app.pause = &pauseScene.b.base;
+    app.over  = &overScene.b.base;
+
+    if (app.music)
+        CremaMusicStart(app.music);
 
     CremaFrame frame;
     CremaFrameInit(&frame, CREMA_PACING_FENCED, 1);
@@ -762,121 +1063,51 @@ int main(int argc, char **argv)
     CremaInput input;
     CremaInputInit(&input);
 
-    static const float SPACE[4] = { 0.03f, 0.05f, 0.09f, 1.0f };
+    CremaSceneRequest(&app.stack, CREMA_SCENE_GOTO, app.title);
+    CremaSceneApply(&app.stack, NULL);   // nothing drawn yet: nothing to drain
 
     while (CremaAppRunning()) {
         CremaClockTick(&clock);
-        float dt = clock.dt;
         CremaInputPoll(&input);
-        game.stateTime += dt;
 
-        // The state machine, which is the point of this PoC as much as the
-        // shooting is. Four states and the transitions between them are what
-        // separates a demo that runs from a game that can be finished, lost and
-        // started again — and none of it existed anywhere in Crema before now.
-        switch (game.state) {
-        case STATE_TITLE:
-            if (CremaInputPressed(&input, VPAD_BUTTON_A)) {
-                resetRound(&game);
-                game.state = STATE_PLAY;
-                game.stateTime = 0.0f;
-            }
-            break;
-        case STATE_PLAY:
-            if (CremaInputPressed(&input, VPAD_BUTTON_PLUS)) {
-                game.state = STATE_PAUSED;
-                game.stateTime = 0.0f;
-                CremaMusicSetVolume(music, 0.35f);
-            } else {
-                updatePlay(&game, &input, &sfx, dt);
-            }
-            break;
-        case STATE_PAUSED:
-            if (CremaInputPressed(&input, VPAD_BUTTON_PLUS)) {
-                game.state = STATE_PLAY;
-                game.stateTime = 0.0f;
-                CremaMusicSetVolume(music, 1.0f);
-            }
-            break;
-        case STATE_OVER:
-            // A second before the prompt appears. Nothing updates in this
-            // state except the effects, so the last explosion finishes burning
-            // over a scene frozen where it went wrong — which is the right
-            // thing to be looking at while you read your score.
-            if (game.stateTime > 1.0f &&
-                CremaInputPressed(&input, VPAD_BUTTON_A)) {
-                CremaEntityClear(&game.pool);
-                game.state = STATE_TITLE;
-                game.stateTime = 0.0f;
-            }
-            break;
-        }
-
-        if (game.state != STATE_PAUSED)
-            CremaEffectUpdate(&game.fx, dt);
-
+        CremaSceneUpdate(&app.stack, &input, clock.dt);
         CremaAudioUpdate();
 
         uint32_t slot = CremaFrameBegin(&frame);
-
-        GlobalBlock blk;
-        blk.viewProj = viewProj;
-        blk.lightDir[0] = lightDir.x; blk.lightDir[1] = lightDir.y;
-        blk.lightDir[2] = lightDir.z; blk.lightDir[3] = 0.0f;
-        blk.time[0] = clock.elapsed;
-        blk.time[1] = blk.time[2] = blk.time[3] = 0.0f;
-        view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
-
-        // The billboards ask for three numbers of their own rather than reading
-        // this game's Global block, which is what lets the same renderer serve
-        // a shooter whose camera never moves and a flight demo whose camera
-        // never stops. The camera here being fixed, its basis is a constant.
-        CremaEffectView fxView;
-        fxView.viewProj = viewProj;
-        fxView.camRight[0] = 1.0f; fxView.camRight[1] = 0.0f;
-        fxView.camRight[2] = 0.0f; fxView.camRight[3] = 0.0f;
-        fxView.camUp[0] = 0.0f;    fxView.camUp[1] = cosf(camPitch);
-        fxView.camUp[2] = -sinf(camPitch); fxView.camUp[3] = 0.0f;
-        view.fxViewUbo = CremaUniformRingStore(&fxViews, slot, &fxView,
-                                               sizeof(fxView));
-
-        view.instCount = packInstances(&game, instData, MAX_INSTANCES);
-        view.instUbo   = CremaUniformRingStore(&instances, slot, instData,
-                                               INST_BYTES);
-        view.fxCount   = CremaEffectPack(&game.fx, fxData, MAX_EFFECTS);
-        view.fxUbo     = CremaUniformRingStore(&effects, slot, fxData,
-                                               CREMA_EFFECT_BLOCK_BYTES);
-
-        buildHud(&game, &hud);
-        view.hudCount = hud.count;
-        view.hudUbo   = CremaUniformRingStore(&hudRing, slot, hud.items,
-                                              CREMA_HUD_BLOCK_BYTES);
-
-        CremaFrameDrawBoth(SPACE, drawWorld, &view);
+        CremaSceneBuild(&app.stack, slot);
+        CremaFrameDrawBoth(CremaSceneClearColor(&app.stack), CremaSceneDraw,
+                           &app.stack);
         CremaFrameEnd(&frame, &stats);
 
-        if (stats.updated)
-            WHBLogPrintf("[poc12] %.1f fps | sync %.2f ms | state %d | "
+        // This game's transitions are instant, so there is no reason to wait.
+        CremaSceneApply(&app.stack, &frame);
+
+        if (stats.updated) {
+            CremaScene *top = CremaSceneTop(&app.stack);
+            WHBLogPrintf("[poc12] %.1f fps | sync %.2f ms | %s (depth %u) | "
                          "entities %u | fx %u | score %u | voices %u",
-                         stats.fps, stats.drainMs, game.state,
-                         CremaEntityActiveCount(&game.pool), view.fxCount,
-                         game.score, (unsigned)CremaAudioVoicesInUse());
+                         stats.fps, stats.drainMs,
+                         top ? top->name : "(none)", app.stack.depth,
+                         CremaEntityActiveCount(&playScene.pool),
+                         playScene.fxCount, playScene.score,
+                         (unsigned)CremaAudioVoicesInUse());
+        }
     }
 
     CremaFrameSettle(&frame);
-    CremaMusicClose(music);
-    CremaBankClose(&bank);
-    CremaUniformRingDestroy(&globals);
-    CremaUniformRingDestroy(&instances);
-    CremaUniformRingDestroy(&fxViews);
-    CremaUniformRingDestroy(&effects);
-    CremaUniformRingDestroy(&hudRing);
-    CremaEffectRendererDestroy(&fxRenderer);
-    CremaHudRendererDestroy(&hudRenderer);
-    CremaMeshDestroy(&ship);
-    CremaTextureDestroy(&hull);
-    CremaTextureDestroy(&font);
-    CremaShaderFree(shShip);
+    while (app.stack.depth > 0) {
+        CremaScene *s = app.stack.items[--app.stack.depth];
+        if (s->leave)
+            s->leave(s);
+    }
+    CremaMusicClose(app.music);
+    CremaBankClose(&app.bank);
+    CremaEffectRendererDestroy(&app.fxRenderer);
+    CremaHudRendererDestroy(&app.hudRenderer);
+    CremaMeshDestroy(&app.ship);
+    CremaTextureDestroy(&app.hull);
+    CremaTextureDestroy(&app.font);
+    CremaShaderFree(app.shShip);
     CremaShaderShutdownCompiler();
     CremaAudioShutdown();
     CremaSaveShutdown();

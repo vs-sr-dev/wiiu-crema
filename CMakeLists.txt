@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.13)
 project(crema C CXX)
 
-# Crema — a clean-room GX2 rendering framework for Wii U homebrew.
+# Crema — a clean-room framework for Wii U homebrew.
 # Sits on top of Espresso and Latte, like any good crema should.
 add_library(crema STATIC
     crema/crema_app.c

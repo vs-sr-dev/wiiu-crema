@@ -2,14 +2,20 @@
 
 # Crema ☕
 
-**A clean-room GX2 rendering framework for Wii U homebrew** — it sits on top
-of *Espresso* (the CPU) and *Latte* (the GPU), like any good crema should.
+**A clean-room framework for Wii U homebrew** — it sits on top of *Espresso*
+(the CPU) and *Latte* (the GPU), like any good crema should.
 
 Crema is a small, honest layer: runtime GLSL shaders, cache-safe resource
-handling, frame pacing, sound, and the hard-earned lessons of getting GX2 code
-from the Cemu emulator onto real silicon. It ships with eleven progressive
-examples, each one verified on real hardware, culminating in a flyable game —
-59.9 fps, the CPU idle, and an engine note that follows the throttle.
+handling, frame pacing, an audio stack that treats AX as what it is, and the
+hard-earned lessons of getting GX2 code from the Cemu emulator onto real
+silicon. It ships with twelve progressive examples, each one verified on real
+hardware — a flyable game at 59.9 fps with the CPU idle and an engine note that
+follows the throttle, and a shoot-'em-up you can actually lose.
+
+It started as a rendering framework and the word has quietly stopped being
+true; it is not an engine yet either, and the two things standing between it
+and that word are known by name — nothing here can save anything, and nothing
+here knows what a scene is.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
@@ -58,7 +64,11 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   chip), and a voice is that buffer played at a pitch. One-shots are fired and
   forgotten, reclaimed when they end; a held voice you own and retune every
   frame. Init it *first*: until a title takes AX over, the system keeps playing
-  the transition audio it was handed — which is the Wii U Menu's music
+  the transition audio it was handed — which is the Wii U Menu's music. It also
+  owns the two things a mix needs that nothing else was keeping track of: the
+  three **aux sends** that put your own code in AX's signal path, and a
+  **headroom** applied to every voice, because a mixer that only adds has no
+  idea how loud it is
 - **crema_bank** — instruments: PCM plus the number that makes a sample an
   instrument, how many samples are one cycle. A note is then a playback rate
   and nothing else. The bank keeps its own cache-flushed copy, because unlike
@@ -610,6 +620,16 @@ way, roughly one per PoC. If you write GX2 code, this list is the part you want:
    `AXInit` and 0x0 after** on hardware (in Cemu it is 0x0 either side — the
    emulator never hands you anything, so this one is invisible there). Init
    audio *first*, before you load a single asset.
+8. **The emulator does not only forgive — it also lies the other way.** Every
+   lesson above is "works in Cemu, breaks on hardware", and it is tempting to
+   conclude the console is simply the stricter machine. It is not. The
+   sequencer, which is pure arithmetic, cost 14 µs on hardware against 42 in
+   Cemu; the echo, which walks a 76 KB delay line, cost 23 µs on hardware
+   against 6-8 in Cemu. Cemu runs on a CPU with enormous caches, so it hides
+   memory costs, and it measures through its own JIT, so it inflates
+   arithmetic. **Compute-bound code looks worse in the emulator than it is;
+   memory-bound code looks better.** Profile the second kind on the console or
+   do not profile it.
 
 Also: front faces are **CCW seen from outside** with culling on, and tiled
 textures (`GX2_TILE_MODE_DEFAULT`, GPU-swizzled from a linear staging copy)
@@ -655,6 +675,11 @@ compiler entirely (the Immaterial demo pattern).
 - Audio: AX reports **96 voices** over a 48 kHz mix, resampling each one from
   whatever rate you baked it at. A handful playing cost nothing we could
   measure — the frame stayed at 59.9 fps with 0.00 ms of CPU sync.
+- Audio thread: the frame is **3000 µs** (144 samples at 48 kHz, 333 times a
+  second). A four-channel sequencer with envelopes and vibrato costs **1-2 µs**
+  typical and 8-16 µs worst; a 170 ms stereo echo in the aux callback costs
+  **12-13 µs**. Together under 1% — the DSP work on this console is not the
+  thing that will run out.
 - Engine recipe that gets you there: static vertex/uniform data, animation in
   the vertex shader, instancing, fenced pacing — CPU cost ≈ 0.1 ms/frame.
 
@@ -665,6 +690,12 @@ compiler entirely (the Immaterial demo pattern).
 - GX2 knowledge base: [decaf-emu](https://github.com/decaf-emu/decaf-emu),
   [WiiUBrew](https://wiiubrew.org),
   [Immaterial](https://github.com/glastonbridge/immaterial-wiiu-demo) write-ups
+- [Cemu](https://github.com/cemu-project/Cemu) — not only for running the code
+  before the console did, but as documentation: the AX aux-callback ABI and the
+  meaning of a voice's volume delta were read out of its mixer, because a
+  working emulator had to know answers wut does not write down
+- [chiproll](https://github.com/vs-sr-dev/chiproll) — the piano roll the chip
+  tunes are written in, and the source of the `.csong` format's convictions
 
 ## License
 

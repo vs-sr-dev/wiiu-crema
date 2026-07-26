@@ -5,3 +5,5 @@ external/glslcompiler.rpl
 *.elf
 *.log
 __pycache__/
+tools/fx_render
+tools/fx_render.exe

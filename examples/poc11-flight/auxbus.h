@@ -174,8 +174,15 @@ static bool auxInit(void)
     // restrained for a reason the meter made visible — an aux return adds to a
     // mix that was already over full scale, so an effect's settings are a claim
     // on the same headroom the music is using.
+    //
+    // Wet only, and that last argument is the one the PC tool paid for. This is
+    // an aux bus, so AX adds whatever comes back on top of a main mix that
+    // already has the dry in it: an effect that passed its input through was
+    // buying a second copy of the dry at 30% and calling it reverb. Removing it
+    // does not change the echo by a decibel — the send still scales what the
+    // effect hears — it only stops spending headroom on nothing.
     echoInit(&s_echo, s_echoLine, AUX_LINE, AUX_CHANNELS,
-             8160 /* 170 ms */, 0.35f, 0.45f);
+             8160 /* 170 ms */, 0.35f, 0.45f, true);
 
     // wut's typedef is short an argument, so the function we register is not
     // the type wut wants. Going through a union rather than a cast keeps the

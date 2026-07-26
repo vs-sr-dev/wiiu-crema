@@ -14,6 +14,11 @@
 // and then run unchanged in the audio callback where a wrong number is a
 // reboot.
 //
+// That PC end is `tools/fx_render.c`, and it earned itself on the first run: see
+// `dryMask` for what it found, which had been costing this effect three quarters
+// of its output and the mix a quarter of its headroom since the day it was
+// written. Neither the console nor the emulator had said a word about it.
+//
 // The signal is planar: one buffer per channel, `channels` of them, and the
 // processing is IN PLACE because that is the contract the hardware imposes —
 // AX hands the aux callback the same memory it will read back afterwards.
@@ -28,6 +33,7 @@
 // too, not a preference. See `feedbackQ`.
 
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -42,6 +48,28 @@ typedef struct {
     uint32_t delaySamples;  // how far back the tap is
     float    feedback;      // how much of the tap goes back in: < 1 or it grows
     float    wet;           // how much of the tap comes out
+
+    // Whether the output carries the input, and it is not a taste setting: it
+    // is a statement about where in the mixer this effect is standing, and
+    // getting it wrong costs headroom for nothing.
+    //
+    // On an **aux bus** the mixer sends the effect `send * dry` and adds what
+    // comes back to a main bus that is *already carrying the dry at full level*.
+    // An effect that passes its input through therefore puts a second copy of
+    // the dry into the mix at the send level — 30% louder for no more echo. The
+    // PC tool made this a table instead of a suspicion: with a 20000 click,
+    // send 0.30 and wet 0.45, the aux placement peaked at 26000 with a first
+    // repeat of 2700, while the same numbers as an insert peaked at 20000 with a
+    // repeat of 9000. Same effect, same settings, and the aux path was spending
+    // its whole send budget on volume.
+    //
+    // On an **insert** (a device final-mix callback) the effect has been given
+    // the mix itself, so dropping the dry would drop everything.
+    //
+    // Stored as a mask rather than a flag because this is read once per sample
+    // in a loop that costs 12.5 µs of a 3000 µs frame: `in & -1` is `in`,
+    // `in & 0` is silence, and an AND is a cycle where a multiply would be five.
+    int32_t  dryMask;
 
     // The same two gains in 12-bit fixed point, which is what the loop actually
     // uses. Not premature: this CPU has no instruction that turns an integer
@@ -66,11 +94,15 @@ typedef struct {
 } Echo;
 
 // `buffer` must hold channels * length int32s and outlive the effect.
+//
+// `wetOnly` has no sensible default, which is why it is a parameter and not a
+// setter with one: see `dryMask`. True on an aux send, false on an insert.
 static inline void echoInit(Echo *e, int32_t *buffer, uint32_t length,
                             uint32_t channels, uint32_t delaySamples,
-                            float feedback, float wet)
+                            float feedback, float wet, bool wetOnly)
 {
     memset(e, 0, sizeof(*e));
+    e->dryMask  = wetOnly ? 0 : -1;
     e->buffer   = buffer;
     e->length   = length;
     e->channels = channels;
@@ -129,7 +161,7 @@ static inline void echoProcess(Echo *e, int32_t *const *data,
             int32_t in  = ch[i];
             int32_t tap = line[r];
 
-            int32_t out = in + ((tap * e->wetQ) >> 12);
+            int32_t out = (in & e->dryMask) + ((tap * e->wetQ) >> 12);
             line[w] = in + ((tap * e->feedbackQ) >> 12);
             ch[i]   = out;
 

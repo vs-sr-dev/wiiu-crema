@@ -562,8 +562,30 @@ int main(int argc, char **argv)
     // 0.40 brought the dry mix down to 40-66%, but the meter only sees the
     // voices: the echo's return is added afterwards, and at 0.40 its peak was
     // another 10738 on top of a dry 21561 — 98% of full scale if the two ever
-    // line up. 0.35 keeps the sum under 90% with the effect running, which is
-    // what a headroom is for.
+    // lined up. Hence 0.35.
+    //
+    // It went to 0.40 for one afternoon, on the argument that most of that 10738
+    // was not the echo at all: `echoProcess` used to return its input along with
+    // the wet signal, and on an aux bus the input is `send * dry`, so a third of
+    // it was a second copy of the dry mix being added to the first. Fixing that
+    // (echo.h's `dryMask`) does free real margin, and Cemu agreed — its worst
+    // second at 0.40 was 25786, 79%.
+    //
+    // The console disagreed, and it is the one that gets a vote. An explosion
+    // landing ten metres away while the music was busy read:
+    //
+    //     [mix] peak 32508 (99% of full scale) | headroom 0.40
+    //
+    // once in two minutes, with the echo's return of 4764 stacked on top of that.
+    // So it clipped. Cemu never produced the coincidence, which is not a lie on
+    // its part — it is what a peak meter over a short session is worth.
+    //
+    // Back at 0.35, where the same reading scales to 28444 dry (87%) plus 4169 of
+    // echo: 99.5%, right on the line and not over it. Which means the wet-only
+    // fix bought **margin, not volume** — at 0.35 before it, the same instant
+    // would have summed to about 124% and clipped hard. The number that was
+    // chosen by measurement a day earlier was already correct; what changed is
+    // that it is now correct with room to spare instead of by luck.
     CremaAudioSetHeadroom(0.35f);
     if (auxInit())
         auxSetEnabled(true);    // on from the start; Y is the A/B against dry

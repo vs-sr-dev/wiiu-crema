@@ -219,17 +219,25 @@ python tools/gen_song.py  examples/poc11-flight/assets/audio/theme.csong
 ```
 
 What comes out of the generator is ordinary 16-bit mono WAV, so the preview tool
-is whatever plays WAVs on your machine. It also prints what an ear cannot: the
-explosion was clipping 550 samples flat on its attack (now saturated by a `tanh`
-— an explosion should sound squashed, but by a curve, not by a ceiling), and the
-engine loop's wrap-around step is 359 against a largest in-loop step of 423, so
-the loop closes without the tick you would otherwise hear five times a second
-and blame on the DSP.
+is whatever plays WAVs on your machine. It also prints things an ear cannot put a
+number on: the explosion was clipping 550 samples flat on its attack (now
+saturated by a `tanh` — an explosion should sound squashed, but by a curve, not by
+a ceiling), and the engine loop's wrap-around step is 359 against a largest
+in-loop step of 423, so the loop closes without the tick you would otherwise hear
+five times a second and blame on the DSP.
 
-The `.cbank` adds the one number a WAV cannot carry and an instrument cannot do
-without: how many samples make one cycle. From it, a note is only a playback
+It is worth saying plainly that this cuts both ways, because two of the worst
+faults in this whole audio stack were found *by ear on the console* and are
+invisible in every number above — see the wavetable section. **A generator prints
+what you thought to ask it, so the list of what it prints is the list of what you
+are able to notice.** Both of those numbers are now in the report because
+something got past them once.
+
+The `.cbank` then adds what a WAV cannot carry. The number an instrument cannot do
+without is how many samples make one cycle: from it, a note is only a playback
 rate — `ratio = frequency * cycleSamples / rate` — and that is the entire theory
-of playing music on this hardware.
+of playing music on this hardware. Two later versions added the rest: v2 the shape
+of a note (envelope and vibrato), v3 the state an ADPCM voice decodes from.
 
 A song (`.csong`) is **a piano roll, not a pattern grid**: a flat list of events
 sorted in time. It names its instruments instead of indexing them, so a bank and
@@ -486,7 +494,8 @@ Not "close to clipping" — nearly twice over, continuously. `CremaAudioSetHeadr
 scales every voice's main bus *and its sends together*, so turning it down costs
 volume and never balance, and an effect stays in the same proportion to the dry
 signal. At 0.35 the same scene reads **55-69%** in Cemu and **30-72%** on the
-console, with the echo's return accounting for another 25% on top of that.
+console, with the echo's return accounting for another 25% on top of that — a
+figure the next section takes apart, because most of it turned out not to be echo.
 
 The general lesson is not about this game. **A mixer that only adds has no idea
 how loud it is**, and neither does anyone reading the code; the number was
@@ -922,8 +931,18 @@ a different piece of work with a different trade.
 
 ## Lessons learned (Cemu vs real hardware)
 
-All of these look fine in Cemu and are wrong on the console — found the hard
-way, roughly one per PoC. If you write GX2 code, this list is the part you want:
+Found the hard way, roughly one per PoC. If you write GX2 code, this list is the
+part you want.
+
+The first eight all have the same shape — *looks fine in Cemu, wrong on the
+console* — and for a long time that seemed to be the only shape a lesson could
+have. It is not, and the later ones are worth reading for the difference. Some
+are questions **neither** machine answers, because the answer is policy rather
+than behaviour (9, 10). One is a case where nothing was going wrong anywhere and
+only a PC render could tell (11). Two were found **by ear**, by a person, and no
+number any build printed came near them (12, 13) — which is the most useful thing
+on this list if you are writing audio, because it means the measurements you have
+chosen to print define what you are able to notice.
 
 1. **`GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK)`** is required on
    hardware for CafeGLSL shaders; Cemu renders without it.
@@ -1045,10 +1064,15 @@ compiler entirely (the Immaterial demo pattern).
   whatever rate you baked it at. A handful playing cost nothing we could
   measure — the frame stayed at 59.9 fps with 0.00 ms of CPU sync.
 - Audio thread: the frame is **3000 µs** (144 samples at 48 kHz, 333 times a
-  second). A four-channel sequencer with envelopes and vibrato costs **1-2 µs**
-  typical and 8-16 µs worst; a 170 ms stereo echo in the aux callback costs
-  **12-13 µs**. Together under 1% — the DSP work on this console is not the
-  thing that will run out.
+  second). A four-channel sequencer with envelopes, vibrato and wavetables costs
+  **1-2 µs** typical and 26 µs worst; a 170 ms stereo echo in the aux callback
+  costs **13 µs** typical and 31 µs worst. Together under 1% — the DSP work on
+  this console is not the thing that will run out.
+- ADPCM costs the DSP **nothing**: a voice decoding four bits a sample is the
+  same price as one reading sixteen, so 3.5:1 is free at playback and paid for
+  entirely by the baker. Which makes audio memory a compile-time decision rather
+  than a runtime trade — 96 KB of instruments became 47 with two of eleven
+  compressed.
 - Engine recipe that gets you there: static vertex/uniform data, animation in
   the vertex shader, instancing, fenced pacing — CPU cost ≈ 0.1 ms/frame.
 
@@ -1060,9 +1084,10 @@ compiler entirely (the Immaterial demo pattern).
   [WiiUBrew](https://wiiubrew.org),
   [Immaterial](https://github.com/glastonbridge/immaterial-wiiu-demo) write-ups
 - [Cemu](https://github.com/cemu-project/Cemu) — not only for running the code
-  before the console did, but as documentation: the AX aux-callback ABI and the
-  meaning of a voice's volume delta were read out of its mixer, because a
-  working emulator had to know answers wut does not write down
+  before the console did, but as documentation: the AX aux-callback ABI, the
+  meaning of a voice's volume delta, and the whole of the DSP-ADPCM frame format
+  down to the nibble offsets were read out of its mixer, because a working
+  emulator had to know answers wut does not write down
 - [chiproll](https://github.com/vs-sr-dev/chiproll) — the piano roll the chip
   tunes are written in, and the source of the `.csong` format's convictions
 

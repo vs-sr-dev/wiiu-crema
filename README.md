@@ -2,7 +2,7 @@
 
 # Crema ☕
 
-**A clean-room framework for Wii U homebrew** — it sits on top of *Espresso*
+**A clean-room engine for Wii U homebrew** — it sits on top of *Espresso*
 (the CPU) and *Latte* (the GPU), like any good crema should.
 
 Crema is a small, honest layer: runtime GLSL shaders, cache-safe resource
@@ -15,22 +15,29 @@ role-playing game whose field is still standing where you left it when the
 battle ends, and a football match whose ball takes the same flight whether the
 console is idle or drowning.
 
-It started as a rendering framework and the word has quietly stopped being true.
-It is still not called an engine here, and that is a decision rather than a gap.
-Everything that was named as standing in the way has now gone: **it can save** —
-a high score survives the power going off — **it knows what a scene is**, which
-is a lifetime and not a game state, verified by two different games, and the
-slice that was supposed to ask for something new has been built and has asked
-for it. A football wanted a ball that obeys physics rather than a script, a net
-you can see the players through, and a clock that is not the frame rate; it got
-all three, and none of them needed the framework changed to make room.
+It started as a rendering framework, and it was called that for as long as the
+word was the true one. Every criterion ever named as standing between it and
+this one has now gone: **it can save** — a high score survives the power going
+off — **it knows what a scene is**, which is a lifetime and not a game state,
+verified by two different games — and **it has been asked by something that had
+never asked it before**. A football wanted a ball that obeys physics rather than
+a script, a net you can see the players through, and a clock that is not the
+frame rate. It got all three, and `crema/` did not change by a single line to
+make room for any of them.
 
-What that leaves is not a checklist item. The word is one person's to claim and
-it has not been claimed here yet.
+So the word is claimed. Which sense of it is worth saying plainly, because
+there is more than one. Crema is an engine as a **reusable layer**: four games
+in four genres stand on it, and the newest needed nothing added. It is not an
+engine as a **product** — there is no editor, no GUI, no inspector, no asset
+browser. You write C, you own your own storage, and it never takes your main
+loop away from you. That is a position rather than a shortfall: every piece of
+it exists because a game asked for that piece twice, and nothing was designed in
+advance. But it is a position, and it is better read before the download than
+after.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
-## What the framework provides (`crema/`)
+## What the engine provides (`crema/`)
 
 - **crema_app** — ProcUI lifecycle, UDP + Cemu logging, per-second frame
   stats (fps / frame ms / GPU-drain ms)

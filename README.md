@@ -171,7 +171,7 @@ handed back.
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
 | 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves, a record that survives the power going off — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs. Its four game states were later rewritten as four scenes, which is what made `crema_scene` more than one example's preference | 59.9 fps, 0.00 ms sync, save **47 ms on console** |
 | 13 | `poc13-quest` | a slice of a role-playing game, and the first thing here with two places: a field you walk, a battle pushed on top of it that leaves the field standing, a see-through status menu, a journal on the card and a hero who comes back to where they stood | 59.9 fps, 0.00 ms sync, **no frame dropped by any scene change** |
-| 14 | `poc14-kickoff` | a slice of a football match, and the first thing here whose clock is not the frame: eight stick figures assembled from three bricks, a ball with drag, spin and a bounce, goals with see-through nets, twenty thousand blades of grass, and a simulation stepping at 120 Hz under a 59.94 Hz picture | *console run pending* — 60.1 fps, 0.00 ms sync in Cemu, **the same kick lands on the same five decimals at 60 fps and at 38** |
+| 14 | `poc14-kickoff` | a slice of a football match, and the first thing here whose clock is not the frame: eight stick figures assembled from three bricks, a ball with drag, spin and a bounce, goals with see-through nets, twenty thousand blades of grass, and a simulation stepping at 120 Hz under a 59.94 Hz picture | 59.9 fps, 0.00 ms sync with the grass on, **the same kick lands on the same five decimals at 59.9 fps and at 37.5** |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -1098,11 +1098,6 @@ lifetimes.
 
 ### The clock is not the frame
 
-> Every number in this section and the next is from **Cemu**, and is marked as
-> such until the console has run it. Every other measurement in this file was
-> taken on hardware; these two sections are the only ones waiting, and the
-> project's own rule is that the emulator is not to be believed until it agrees.
-
 Every example before PoC 14 integrated against the frame: `pos += vel *
 clock.dt`, with `dt` whatever the last frame happened to take. That is fine for
 a ship being told where to go, and it stops being fine the moment something
@@ -1127,26 +1122,38 @@ worldLerp(&prev, &cur, alpha, &view);  // what is drawn is neither state
 ```
 
 **120 Hz rather than 60, deliberately.** The console presents at 59.94 Hz, not
-60, so an accumulator at 120 never settles into a tidy two-per-frame — measured
-over a run it does two, two, two, *three*: `steps avg 2.000 (1:2 2:1954 3:188)`.
-The awkward step is not a defect to tune away. It is the accumulator earning its
-keep, and the interpolation is what makes it invisible; `alpha` is a different
-number every frame, never 0 and never 1.
+60, so an accumulator at 120 never settles into a tidy two-per-frame. Counted on
+hardware over thirteen seconds of play — **780 frames, 1561 steps** — the
+histogram moved by 775 twos, 3 threes and 2 ones: 2.0013 steps a frame, 119.96
+steps a second. The awkward third step is not a defect to tune away; it is the
+accumulator absorbing the 0.06 Hz the console is not running at, three times in
+thirteen seconds, and the interpolation is what makes it invisible. `alpha` is a
+different number every frame and is never 0 and never 1.
 
 **The claim, and how it is checked.** The example fires the same kick twice
 before the whistle — once with the console idle, once with 26 ms burned out of
-every frame — and prints where the ball is after exactly 240 steps:
+every frame — and prints where the ball is after exactly 240 steps. On real
+hardware:
 
 ```
-PROBE quiet  at 60.1 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
-PROBE loaded at 38.2 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
+PROBE quiet  at 59.9 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
+PROBE loaded at 37.5 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
 ```
 
-Five decimals, twenty-two frames per second apart. It runs on a timer rather
-than on a button, because a measurement that depends on somebody remembering to
-take it is a measurement nobody takes twice — and it is fenced off from the
-players, because twice in a row the two runs agreed only because nobody happened
-to reach the ball. Luck reported as a result is worse than no result.
+Five decimals, twenty-two frames a second apart. And those are the same twelve
+digits Cemu printed, which is worth stating because this file spends most of its
+length on the emulator being wrong: **the one thing it does not lie about is
+arithmetic.** The console and the emulator run the same PowerPC float ops, and
+`-ffp-contract=off` in the toolchain file keeps the compiler from fusing a
+multiply-add and rounding once where the other rounds twice. That flag was added
+for a Little Big Adventure port years before any of this existed; it is the
+reason a physics probe is comparable across the two at all.
+
+The probe runs on a timer rather than on a button, because a measurement that
+depends on somebody remembering to take it is a measurement nobody takes twice —
+and it is fenced off from the players, because twice in a row the two runs agreed
+only because nobody happened to reach the ball. Luck reported as a result is
+worse than no result.
 
 **Four things the fixed step forces, none of them obvious in advance:**
 
@@ -1215,7 +1222,11 @@ back**, three `normalize()` calls against 25% more instance bandwidth.
 
 **Grass costs nothing and the obvious optimisation was the bug.** 19,928
 blades, one triangle each, opaque and tapered so there is no alpha to blend and
-nothing to sort: 59.9 fps, unchanged. The first version had the patch follow
+nothing to sort: **59.9 fps and 0.00 ms of CPU sync on the console, unchanged
+with them on**, which is what a 2.2M-triangle budget looks like when you spend
+20k of it. The only bill is at startup and it is the one place the console is
+much slower than the emulator: **33 ms to build the buffer against Cemu's
+10 ms**, paid once. The first version had the patch follow
 the camera, snapped to the blade spacing — PoC 11's ground trick, which works
 because *a tiling texture is the same at every offset*. A jittered grid is not.
 Shift it by one cell and every blade lands where its neighbour was, and the

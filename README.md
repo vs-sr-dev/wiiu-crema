@@ -13,9 +13,10 @@ hardware — a flyable game at 59.9 fps with the CPU idle and an engine note tha
 follows the throttle, and a shoot-'em-up you can actually lose.
 
 It started as a rendering framework and the word has quietly stopped being
-true; it is not an engine yet either, and the two things standing between it
-and that word are known by name — nothing here can save anything, and nothing
-here knows what a scene is.
+true; it is not an engine yet either, but of the two things that were standing
+between it and that word, one has gone: **it can save now** — the shoot-'em-up's
+high score survives the power going off. What is still missing is a name for the
+other one: nothing here knows what a scene is.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
@@ -72,7 +73,14 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 - **crema_bank** — instruments: PCM plus the number that makes a sample an
   instrument, how many samples are one cycle. A note is then a playback rate
   and nothing else. The bank keeps its own cache-flushed copy, because unlike
-  a texture an instrument is read by the DSP *while it plays*
+  a texture an instrument is read by the DSP *while it plays*. Samples may be
+  **ADPCM**, which the Wii U decodes in hardware for the same price as PCM —
+  four bits a sample, so the compression is free at playback and paid for
+  entirely by the baker
+- **crema_save** — persistence: a named blob on the SD card beside the `.wuhb`,
+  with a magic, a version the *caller* owns, and a checksum, replaced by writing
+  elsewhere and renaming so that losing power costs the new save and not the old
+  one. Not `nn_save`, and that is a decision with a reason — see below
 - **crema_music** — the sequencer, ticking on AX's audio frame (3 ms) instead
   of on the game loop, and never allocating there: channels reserve their
   voices up front, and a note-on re-aims a voice the channel already owns
@@ -117,7 +125,7 @@ while (CremaAppRunning()) {
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
-| 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs | 59.9 fps, 0.00 ms sync |
+| 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves, a record that survives the power going off — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs | 59.9 fps, 0.00 ms sync, save 1.1 ms |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -207,6 +215,7 @@ a rebuild:
 python tools/gen_waves.py examples/poc11-flight/assets/audio   # WAVs + manifest
 python tools/crema_bake.py bank content/audio.cbank assets/audio/bank.json
 python tools/gen_song.py  examples/poc11-flight/assets/audio/theme.csong
+./tools/build_fx.sh && tools/fx_render --impulse --out clicks.wav   # audition an effect
 ```
 
 What comes out of the generator is ordinary 16-bit mono WAV, so the preview tool
@@ -483,6 +492,245 @@ The general lesson is not about this game. **A mixer that only adds has no idea
 how loud it is**, and neither does anyone reading the code; the number was
 available all along from hardware that was already summing it for us.
 
+### The PC end of the effect, and what it found on the first run
+
+`echo.h` was written to include no console header, so that the same arithmetic
+could be auditioned on a PC where a wrong number is a rerun and then run
+unchanged in an audio callback where a wrong number is a reboot. For a day it
+had nothing to be auditioned *with*. `tools/fx_render.c` is that thing: it reads
+a WAV, hands the effect a **planar int32 buffer, 144 samples at a time**, and
+writes the result back out. Not a simulation — the same file, the same shape, the
+same block size AX uses. Byte order is the one thing deliberately not copied:
+the samples are native on both machines, and a tool that byteswapped would be
+testing a bug the console cannot have.
+
+It paid for itself immediately. Rendered with a click train, in the placement the
+console actually uses:
+
+| | the click | 1st repeat | 2nd | 3rd |
+|---|---|---|---|---|
+| on an aux bus | **26000** | 2700 | 945 | 331 |
+| as an insert | 20000 | 9000 | 3149 | 1102 |
+
+The click was 20000 going in. On the aux bus it came out at 26000 — and the extra
+30% is exactly the send level, because **`echoProcess` returned its input along
+with the wet signal, and on an aux bus the input is `send * dry`**. AX adds an
+aux return to a main mix that is already carrying the dry at full level, so the
+effect was buying a second copy of the dry mix and calling it reverb: three
+times less echo than the same settings give as an insert, for 30% more level.
+That is a quarter of the headroom this project had spent a whole section
+measuring, and it had been going into nothing since the day the effect was
+written. Neither the console nor the emulator had said a word about it, because
+both were doing precisely what they were asked.
+
+The fix is one AND per sample — `in & dryMask`, where the mask is 0 for a send
+and −1 for an insert, and an AND is a cycle where a multiply would be five. The
+echo is unchanged to the decibel and the mix peak fell from 130% of the dry to
+100%. On hardware the effect still costs **13 µs of a 3000 µs frame**, exactly
+what it cost before, and the aux meter now reads `peak in 9755, out 4764` where
+the output had previously been arithmetically guaranteed to exceed the input.
+
+Then the console corrected the conclusion, which is the part worth keeping. The
+recovered margin looked like room for more volume, so PoC 11's headroom went from
+0.35 to 0.40 — and Cemu agreed, worst second 79% of full scale. Two minutes on
+real hardware said otherwise:
+
+```
+[14:08:15.586] [flight] hit at 10 m - score 6
+[14:08:16.112] [mix] peak 32508 (99% of full scale) | headroom 0.40
+```
+
+An explosion ten metres away while the music was busy, once, with the echo's
+4764 stacked on top of that — so it clipped. Cemu never produced the coincidence,
+which is not an emulator lie; it is what a peak meter over a short session is
+worth. Back at 0.35 the same instant scales to 28444 dry plus 4169 of echo:
+99.5%, on the line and not over it. **The fix bought margin, not volume** — at
+0.35 *before* it, that instant would have summed to roughly 124%. The headroom
+that had been chosen by measurement a day earlier was already right; what changed
+is that it is now right with room to spare instead of by luck.
+
+The general point:
+
+> **An effect has to know where in the mixer it is standing.** A send returns wet
+> only, because the dry is already there; an insert has been given the mix and
+> must give it back. There is no sensible default, which is why it is an argument
+> to `echoInit` and not a setter with one.
+
+### A sampler was already a wavetable synthesiser; nobody had asked it
+
+A single cycle in a loop is one timbre forever. Several cycles in a row, looped
+as a whole, is a **wavetable**: the voice walks through them and starts again, and
+the timbre moves without anything on the console doing anything.
+
+The interesting part is what it cost. `.cbank` did not change, `crema_bank` did
+not change, the sequencer did not change, AX did not change. Forty lines in
+`tools/gen_waves.py`, and that is the whole feature — because `cycleSamples` says
+how long **one** cycle is, which is all the pitch arithmetic ever wanted, while
+the loop is the whole buffer:
+
+```
+ratio = frequency * cycleSamples / rate      # 48 cycles or one, same note
+```
+
+Two instruments came out of it: `pwm`, whose duty sweeps 0.50 → 0.09 → 0.50
+across 48 cycles (the sweep lands on multiples of 1/32, so it is a staircase of
+about a dozen steps — which is also what it sounded like on the machines where
+the duty was two bits in a register), and `sync`, a saw running at up to 2.7× the
+rate it is restarted at. The lead of the theme is on `pwm` now and the last bar's
+arpeggio on `sync`.
+
+What it is *not*, and it matters when writing a part: the table is walked once
+per cycle of the note, so **the modulation is pitch-locked** — 9.2 Hz at A4, 18.3
+an octave up. A chip's PWM runs at its own rate and does not care what note is
+playing. This is a different instrument, brighter and thinner up top, and it is
+why the bass is not on it. The LFO version would mean moving a playing voice's
+sample pointer from the audio thread, which is a different feature with a click
+in it.
+
+The parameter sweeps out and back rather than round, so the last cycle is a
+neighbour of the first and the table joins onto itself.
+
+And then the console hummed, which is the actual lesson in this section.
+
+The bass arpeggio was clean on the bars that used a plain oscillator and buzzed on
+the one bar that used a table. The cause is a single sentence: **a pulse of duty
+*d* has an average of *d* − (1 − *d*) times its amplitude.** A 9% pulse sits at
+−81% of full scale and a 50% one sits at zero, so a table that sweeps the duty
+sweeps its own DC offset with it — and a DC offset that moves is not an offset,
+it is a signal. Measured after the fact, `pwm` swept from −16120 to 0 across its
+48 cycles: an 81%-amplitude waveform at the table's rate, 2 to 9 Hz on the notes
+that song plays. `sync` had the same disease at 19%, from truncating a saw at a
+non-integer number of periods.
+
+A real chip does not have this problem, and the reason is not in its digital
+section: **its output is AC-coupled.** A capacitor removes the DC before it
+reaches a speaker, which is why nobody writing for a 2A03 ever thinks about it.
+These samples go straight into a digital mixer, so the capacitor has to be in the
+generator. Taking each cycle's own mean out is the idealised version of one — a
+high-pass whose cutoff is exactly the cycle rate, which leaves the table exactly
+periodic where a real one-pole filter would droop.
+
+The rescale afterwards matters as much as the subtraction, and getting there is
+worth the two lines: a 9% pulse with its mean removed is a spike +2A(1−d) tall,
+which overflows int16 before it sounds like anything. Normalising the table back
+to the peak it started with keeps it in range and keeps it comparable to every
+other instrument in the bank. What falls out is the *correct* behaviour rather
+than a compromise — RMS per cycle goes 6381 at the narrow end to 10946 at 50%,
+so narrow duty is thin and quiet and wide duty is full and loud, which is what
+pulse-width modulation sounds like on hardware that has a capacitor in it.
+
+The generator now prints the DC swing next to the seam, because a number that has
+been wrong once should not be able to go wrong again quietly:
+
+```
+pwm   1536 samples  peak 19840  table of 48 cycles, sweep at f/48, DC swing 1 (0.0% of peak)
+```
+
+And with the hum gone, a second fault underneath it became audible — reported,
+again, more precisely than any instrument would have managed: *"as if the
+wavetable moved in mono-legato compared to the clean attacks of the other bars,
+muddying the sound, like playing fast notes on a mono-legato soundbank."*
+
+It was not legato. **A voice is retriggered from sample zero on every note-on, so
+cycle 0 of a table is the attack** — and the sweep had been written starting at
+the end where the character is absent: a plain saw for `sync`, the thinnest and
+quietest duty for `pwm`. A sixteenth at 132 BPM lasts 113 ms, and at D3 that
+covers seventeen of forty-eight cycles, so every note was hearing only the dullest
+quarter of the table and never arriving where the sound was. Sixteen notes that
+all open soft and swell slightly have no transients between them, and a run of
+them reads as one continuous morph.
+
+Reversing the modulator so the strong end comes first fixed it: short notes get
+the whole character immediately, long ones get the journey, and the table still
+joins onto itself because a palindrome reversed is still a palindrome. Which is a
+design rule rather than a bug fix, and it generalises past this project:
+
+> **Put the sound at cycle zero.** Everything after it is the note evolving;
+> cycle zero is the note arriving. A table whose interesting end is in the middle
+> is a table only long notes can play.
+
+One number is worth stating because it looks like a defect and is not: a pulse
+that swings ±A has an RMS of A whatever its duty, which is the most a waveform
+can have at that peak. A DC-free table with a varying duty cannot match it — the
+narrow cycles become tall spikes, and normalising the table's peak brings
+everything else down with them. Measured, cycle 0 against `pulse25`: `pwm` is
+−5.2 dB and `sync` −6.3 dB. That is arithmetic, not a mistake, and the place to
+compensate is the score, where balance belongs.
+
+### ADPCM, and the four bits the DSP decodes for free
+
+The Wii U decodes Nintendo DSP-ADPCM **in hardware**: an AX voice set to
+`AX_VOICE_FORMAT_ADPCM` costs the DSP exactly what an LPCM16 one does. So the
+compression is free at playback and paid for entirely offline, which makes it the
+rare optimisation with no runtime side to get wrong — except for the three things
+that are not in any header. All of this was read out of Cemu's decoder
+(`snd_core/ax_mix.cpp`, `AX_readADPCMSamples`):
+
+- **A frame is 8 bytes and holds 14 samples.** One header byte, then seven bytes
+  of two nibbles. So the ratio is 3.5:1 and not 4:1 — fourteen samples cost eight
+  bytes, not seven.
+- The header is `predictor << 4 | scale`; the scale is a shift, and the predictor
+  picks one of **eight** coefficient pairs. The decoder masks that nibble with 7,
+  so a ninth would silently be the first.
+- The coefficients are **per voice, not per frame** — sixteen int16 in Q11 handed
+  to AX once. An instrument gets eight second-order predictors chosen for its own
+  material, and each frame says which one fits.
+- **Offsets are counted in nibbles, and the header nibbles count.** Sample *s*
+  lives at nibble `(s / 14) * 16 + (s % 14) + 2`. Getting this wrong is the
+  easiest way to make a voice play static while everything else looks right.
+
+`tools/adpcm.py` is the encoder, and the step that decides the quality is the one
+easiest to skip: fit a second-order predictor to every frame by least squares,
+then **cluster the hundreds of candidates down to eight with k-means** (seeded
+from the data's own quantiles, so a build is reproducible). A fixed coefficient
+table would be simpler and sounds worse, because a pulse wave and an explosion do
+not want the same predictors and the format was built to let each instrument have
+its own. Then every frame tries all eight at the smallest scale that does not
+clamp, **closed loop** — the history fed to the predictor is what the decoder will
+actually reconstruct, so error cannot accumulate unseen. Finally the result is
+decoded again with the console's own arithmetic and the SNR printed, because a
+compressor that cannot tell you what it cost is a compressor you have to trust.
+
+What the numbers said, and they are the reason this is opt-in per instrument
+rather than a switch for the bank:
+
+| instrument | samples | SNR | verdict |
+|---|---|---|---|
+| `engine` | 6400 | **79.8 dB** | five sine harmonics; a second-order predictor guesses it almost exactly |
+| `boom` | 28800 | 29.2 dB | filtered noise and a thump. It is an explosion |
+| `noise` | 4096 | 26.6 dB | noise compressed as noise |
+| `laser` | 7040 | 25.6 dB | the brightest sound in the game, and the one whose edges soften most — left as PCM, it is only 14 KB |
+| `pwm` | 1536 | 21.1 dB | a wavetable of 32-sample cycles |
+| `pulse50` | 32 | 2.67:1 | 2.3 frames long: the header byte stops being a rounding error |
+
+So `boom` and `engine` are compressed and nothing else is. They were 70 KB of the
+bank's 96 and are now 20, and the console — not the emulator — says:
+
+```
+[bank] 11 instruments at 32000 Hz, 47 KB resident (96 KB as PCM16), 2 compressed
+```
+
+and the explosions still sound like explosions, which is the whole test: get the
+nibble arithmetic wrong and a voice plays static rather than anything subtler.
+
+The loop needed the most care, for a reason worth stating plainly: **an ADPCM
+sample is not decodable on its own.** It is a correction to a prediction made from
+the two samples before it, so entering a stream part-way means telling the
+hardware what those two samples were and which frame header is in force. AX has
+fields for exactly that, and the baker fills them by decoding up to the loop
+point rather than by guessing — and it refuses a loop that does not begin on a
+frame boundary, because a frame carries its own scale and there is nowhere else
+to enter it.
+
+One divergence to be aware of, found in the source rather than by ear: **Cemu
+does not restore `loopYn1`/`loopYn2` when a voice loops.** Its
+`handleAdpcmDecodeLoop` resets the scale and the offset and leaves the history
+where the tail left it, while the hardware has fields for that history and uses
+them. Our looping ADPCM instrument loops to sample 0, where the encoder's own
+history was silence, so the two machines differ only in the first two samples
+after each wrap. It is small here. It would not be small for a loop into the
+middle of a sample, and it is not the kind of thing an emulator tells you about.
+
 ### What a second game is for
 
 Nothing in `crema/` was designed. Every module was extracted from an example
@@ -525,6 +773,89 @@ The cost of the extraction, measured: PoC 11 lost 150 lines, PoC 12 lost 118,
 `crema/` gained 142 that both share, and on hardware nothing changed at all —
 59.9 fps, 0.00 ms sync, the echo still 12-13 µs. What is left in each example is
 the one shader that game actually invented.
+
+### Saving, and where a homebrew title is allowed to put a file
+
+The shoot-'em-up had a "BEST" line on its HUD that was a lie the moment you
+pressed HOME: it said *best* and meant *best since you turned it on*. Fixing that
+turned out to be less about writing a file than about deciding where one is
+allowed to go, and of the three candidates only one survives contact with both
+the emulator and the console.
+
+**`/vol/save` via `nn_save`** is the real Wii U answer and is wrong here twice
+over. A `.wuhb` launched under Aroma has no save directory of its own — that path
+belongs to whichever title is hosting it, so a high score would be written into
+somebody else's save data. And Cemu does not export `SAVEInitCommonSaveDir` at all
+(`nn_save.cpp` registers `SAVEInit` and `SAVEInitSaveDir` and stops), so the two
+targets would disagree about a call that cannot be tested in the place it fails.
+**`/vol/content`** is read-only; it is inside the bundle. Which leaves
+**`/vol/external01`** — the SD card, where the `.wuhb` already lives. The file
+lands next to the thing that wrote it, a PC can read it, and both targets reach it
+the same way.
+
+One difference between them is invisible until it bites. Under Aroma the card is
+already mounted process-wide; Cemu's source says it mounts the card only from
+`FSMount` and `FSBindMount`, which reads like *the emulator will not have it until
+we ask*. So the module looks before it mounts — and then found the path already
+there on **both** targets, so the mount never runs. Worth forcing once anyway,
+because an untried fallback is not a fallback: `FSGetMountSource` and `FSMount`
+both return OK against an already-mounted card and change nothing. The probe stays
+in front of it regardless. Under Aroma another module owns that mount and
+refcounts it, and mounting a volume somebody else is holding is not a thing to do
+speculatively.
+
+The file itself carries a magic, a version and an FNV-1a checksum, and is written
+to `record.dat.new` and renamed. Three deliberate choices:
+
+- **The version belongs to the caller, not to the module.** A game that changes
+  the shape of its save says so, and a file from the old shape then reads as
+  *absent* rather than as garbage that happens to fit.
+- **The checksum is not about bit rot**, it is what a half-written file from an
+  earlier crash looks like. Reading it would put a plausible wrong number on
+  screen instead of no number at all.
+- **The rename is the only moment the real name changes meaning.** Until it, the
+  file under the real name is still the previous save, entire — so losing power
+  during a write costs the new score and nothing else.
+
+Costs, measured in Cemu: **1114 µs to write** eight bytes with the header, **402 µs
+to read** them. Slow enough to be worth doing once per game over rather than once
+per point scored, and nowhere near slow enough to need a thread. That is the sort
+of thing worth measuring precisely because both answers were plausible.
+
+Two fields rather than one, on purpose. A high score alone is indistinguishable
+from a single word written to a file; the thing worth proving is that a *struct*
+goes out and comes back with its parts still in the right order. So there is a
+play counter too, and it is on the title screen — a number that is not zero on a
+fresh boot is a number that came from a file.
+
+```
+[save] ready at /vol/external01/wiiu/apps/gx2poc
+[poc12] no record yet in /vol/external01/wiiu/apps/gx2poc (193 us)
+[poc12] record saved: best 14100, 1 games, 1114 us
+...
+[poc12] record loaded from /vol/external01/wiiu/apps/gx2poc: best 14100 after 5 games, 402 us
+```
+
+Verified on the console the only way that counts, and it is worth naming the
+difference: not by returning to the HOME menu, which leaves the process and the
+filesystem cache alive, but by **switching the Wii U off at the wall and turning
+it back on**. The score and the play counter were both there. Anything short of a
+real power cycle can be passed by a save that never reached the card.
+
+Then the card came out of the console and into a PC, which is the part a save
+format is for:
+
+```
+$ xxd record.dat                        # written by the Wii U, read on a PC
+00000000: 4353 4156 0000 0001 0000 0008 47f1 e6de  CSAV........G...
+00000010: 0000 15e0 0000 0002                      ........
+```
+
+`CSAV`, version 1, eight bytes of payload — and `0x15e0` is 5600 with a play
+count of 2. The checksum was recomputed from scratch by a second FNV-1a
+implementation on the other machine and came out `0x47f1e6de`, the same word the
+console wrote. Which is the whole point: **the bytes came back identical, and
+something other than the program that wrote them can say so.**
 
 ### What loading actually costs (measured on console)
 
@@ -630,6 +961,44 @@ way, roughly one per PoC. If you write GX2 code, this list is the part you want:
    arithmetic. **Compute-bound code looks worse in the emulator than it is;
    memory-bound code looks better.** Profile the second kind on the console or
    do not profile it.
+9. **A homebrew title has no save directory of its own.** A `.wuhb` launched
+   under Aroma borrows a host title's, so `nn_save` would write your high score
+   into somebody else's save data — and Cemu does not export
+   `SAVEInitCommonSaveDir` at all, so the emulator cannot even show you the
+   problem. Write to the SD card (`/vol/external01`), next to the `.wuhb`.
+10. **Both machines have the SD card already mounted, and neither says so.**
+   Cemu's source reaches its own mount only from `FSMount`/`FSBindMount`, which
+   reads like "the emulator will not have it until you ask" — and then
+   `/vol/external01` was there on both targets and the fallback never ran. Probe
+   before mounting: under Aroma another module owns that mount and refcounts it.
+11. **An effect on an aux bus must return the wet signal only.** AX adds an aux
+   return to a main mix that is already carrying the dry, so an effect that
+   passes its input through puts a second copy of the dry into the mix at the
+   send level. Ours did, for a day, and it cost a quarter of the mix's headroom
+   and three quarters of the echo's audible output. No emulator will mention
+   this, because nothing is going wrong: it is a question about where the code
+   is standing, and only a PC render answered it.
+12. **A DC offset that moves is a signal.** Chip oscillators have large constant
+   DC offsets — a 9% pulse sits at −81% of full scale — and on real hardware
+   nobody notices, because the output is AC-coupled and a capacitor removes it. A
+   *wavetable* that sweeps the duty sweeps that offset too, and there is no
+   capacitor in a digital mixer: it comes out as a full-amplitude waveform at the
+   table's own rate. It was audible on the console as a hum on the one bar that
+   used a table, and invisible in every number the build was printing. Take each
+   cycle's own mean out, then renormalise.
+13. **Cycle zero of a wavetable is the attack.** A voice is retriggered from
+   sample zero on every note-on, so whatever is in the first cycle is what the
+   ear hears as the note arriving — and a sixteenth at 132 BPM only covers a
+   quarter of a 48-cycle table. A sweep that started at the end without the
+   character in it gave a whole bar of notes no transients, and it sounded like a
+   mono-legato patch rather than like a wrong waveform, which is why it took a
+   listener to name it.
+14. **Cemu does not restore the ADPCM loop history.** Its
+   `handleAdpcmDecodeLoop` resets the frame scale and the offset and leaves
+   `yn1`/`yn2` where the tail left them, while the hardware has fields for
+   exactly that state and uses them. A loop back to sample 0 (where the
+   encoder's own history was silence) barely differs; a loop into the middle of
+   a sample would.
 
 Also: front faces are **CCW seen from outside** with culling on, and tiled
 textures (`GX2_TILE_MODE_DEFAULT`, GPU-swizzled from a linear staging copy)

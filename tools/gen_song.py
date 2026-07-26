@@ -124,9 +124,17 @@ def build():
         chords = {0: ["D3", "F3", "A3", "F3"], 1: ["D3", "F3", "A3", "F3"],
                   2: ["C3", "F3", "A3", "F3"], 3: ["A#2", "D3", "F3", "D3"]}
         arp = chords[bar] * 4
-        s.line(1, "pulse25", arp, b, 0.25, length=0.22, volume=26)
+        # The last bar's arpeggio moves to the sync wavetable, which is the
+        # cheapest lift there is: same notes, same channel, a timbre that was not
+        # there before. The instrument is per event, so this costs one word.
+        s.line(1, "sync" if bar == 3 else "pulse25", arp, b, 0.25,
+               length=0.22, volume=26)
 
-        # lead: enters on the second bar, so the first is the engine's
+        # lead: enters on the second bar, so the first is the engine's. On the
+        # PWM wavetable, because a lead is the one part long enough for a timbre
+        # that moves to be heard moving — and the movement is pitch-locked, so the
+        # high notes shimmer faster than the low ones. That is a property, not a
+        # bug, but it is why the bass is not on it.
         melody = {
             1: [("A4", 1.0), ("F4", 0.5), ("G4", 0.5), ("A4", 2.0)],
             2: [("D5", 1.5), ("C5", 0.5), ("A4", 1.0), ("F4", 1.0)],
@@ -135,7 +143,7 @@ def build():
         t = b
         for note, length in melody:
             if note:
-                s.play(2, "pulse12", note, t, length * 0.92, volume=38)
+                s.play(2, "pwm", note, t, length * 0.92, volume=38)
             t += length
 
         # percussion: the noise instrument is not pitched, so the "note" only

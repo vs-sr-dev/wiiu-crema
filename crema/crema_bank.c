@@ -8,9 +8,16 @@
 #include <string.h>
 #include <whb/log.h>
 
-#define CBANK_VERSION 2
+#define CBANK_VERSION 3
 #define CBANK_HEADER_SIZE 32
 #define CBANK_FLAG_LOOPING 1
+#define CBANK_FORMAT_LPCM16 0
+#define CBANK_FORMAT_ADPCM  1
+
+// A frame of ADPCM holds fourteen samples in eight bytes. The bank stores a
+// count of SAMPLES for both formats, so this is the only place the two differ.
+#define CBANK_ADPCM_FRAME_SAMPLES 14
+#define CBANK_ADPCM_FRAME_BYTES   8
 
 // Mirrors tools/crema_bake.py. Big-endian file, big-endian CPU, and the samples
 // themselves are big-endian too — which is the order AX wants, so the file's
@@ -36,9 +43,19 @@ typedef struct {
     uint16_t attackMs, decayMs, sustain, releaseMs;
     uint16_t vibDelayMs, vibRateMilliHz;
     int16_t  vibDepthCents;
-    uint16_t reserved;
+    // v3: what v2 called `reserved`, and 0 still means the LPCM16 it meant then.
+    uint16_t format;
+    // v3: the decoder state, all zero unless format says ADPCM. Forty-four bytes
+    // per instrument whether or not it uses them, which is the trade a flat
+    // directory makes and is worth 44 bytes: the alternative is a payload with a
+    // variable-length prefix, i.e. parsing, at load time, on the console.
+    int16_t  coefficients[16];
+    uint16_t predScale;
+    int16_t  yn1, yn2;
+    uint16_t loopPredScale;
+    int16_t  loopYn1, loopYn2;
 } BankEntry;
-_Static_assert(sizeof(BankEntry) == 60, "cbank entry is 60 bytes");
+_Static_assert(sizeof(BankEntry) == 104, "cbank entry is 104 bytes");
 
 bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
 {
@@ -67,11 +84,16 @@ bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
     bank->rate = h.rate;
 
     uint32_t loaded = 0;
-    size_t totalSamples = 0;
+    size_t totalSamples = 0, totalBytes = 0;
+    uint32_t compressed = 0;
     for (uint32_t i = 0; i < h.count; i++) {
         BankEntry e;
         memcpy(&e, base + sizeof(BankHeader) + i * sizeof(BankEntry), sizeof(e));
-        size_t bytes = (size_t)e.sampleCount * sizeof(int16_t);
+        bool adpcm = e.format == CBANK_FORMAT_ADPCM;
+        size_t bytes = adpcm
+            ? ((size_t)e.sampleCount + CBANK_ADPCM_FRAME_SAMPLES - 1) /
+              CBANK_ADPCM_FRAME_SAMPLES * CBANK_ADPCM_FRAME_BYTES
+            : (size_t)e.sampleCount * sizeof(int16_t);
         if (e.offset < sizeof(BankHeader) ||
             (size_t)(e.offset) + bytes > size) {
             WHBLogPrintf("[bank] %s points outside the blob", e.name);
@@ -92,16 +114,35 @@ bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
 
         // Copied, not referenced: the DSP reads these samples while the voice
         // plays, long after whatever we were handed has been freed.
-        const int16_t *pcm = (const int16_t *)(base + e.offset);
-        bool ok = (e.flags & CBANK_FLAG_LOOPING)
-            ? CremaSoundCreateLooping(&inst->sound, pcm, e.sampleCount, h.rate,
-                                      e.loopStart)
-            : CremaSoundCreate(&inst->sound, pcm, e.sampleCount, h.rate);
+        const void *payload = base + e.offset;
+        bool looping = (e.flags & CBANK_FLAG_LOOPING) != 0;
+        bool ok;
+        if (adpcm) {
+            CremaAdpcm info;
+            memcpy(info.coefficients, e.coefficients, sizeof(info.coefficients));
+            info.predScale     = e.predScale;
+            info.yn1           = e.yn1;
+            info.yn2           = e.yn2;
+            info.loopPredScale = e.loopPredScale;
+            info.loopYn1       = e.loopYn1;
+            info.loopYn2       = e.loopYn2;
+            ok = CremaSoundCreateAdpcm(&inst->sound, payload, bytes,
+                                       e.sampleCount, h.rate, e.loopStart,
+                                       looping, &info);
+            compressed++;
+        } else if (looping) {
+            ok = CremaSoundCreateLooping(&inst->sound, (const int16_t *)payload,
+                                         e.sampleCount, h.rate, e.loopStart);
+        } else {
+            ok = CremaSoundCreate(&inst->sound, (const int16_t *)payload,
+                                  e.sampleCount, h.rate);
+        }
         if (!ok) {
             WHBLogPrintf("[bank] %s: out of memory", inst->name);
             break;
         }
         totalSamples += e.sampleCount;
+        totalBytes += bytes;
         loaded++;
     }
 
@@ -110,8 +151,12 @@ bool CremaBankLoadFromMemory(CremaBank *bank, const void *blob, size_t size)
         CremaBankClose(bank);
         return false;
     }
-    WHBLogPrintf("[bank] %u instruments at %u Hz, %u KB of samples",
-                 loaded, h.rate, (uint32_t)(totalSamples * 2 / 1024));
+    // Both numbers, because the interesting one is the difference: what the
+    // instruments would have cost as PCM against what they actually occupy.
+    WHBLogPrintf("[bank] %u instruments at %u Hz, %u KB resident "
+                 "(%u KB as PCM16), %u compressed",
+                 loaded, h.rate, (uint32_t)(totalBytes / 1024),
+                 (uint32_t)(totalSamples * 2 / 1024), compressed);
     return true;
 }
 

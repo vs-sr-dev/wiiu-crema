@@ -43,7 +43,7 @@ import struct
 import sys
 
 VERSION = 1
-BANK_VERSION = 2    # v2 carries the envelope; the other formats are still v1
+BANK_VERSION = 3    # v3 carries ADPCM; the other formats are still v1
 HEADER_SIZE = 64
 TEX_HEADER_SIZE = 32
 
@@ -310,16 +310,29 @@ def bake_texture(src, dst, mips=True):
 # v2 added the sixteen bytes after `flags`: attack, decay, sustain, release, and
 # a vibrato. They are the difference between a note and a rectangle, and an
 # instrument that leaves them all zero gets the rectangle it had in v1.
+#
+# v3 added ADPCM, and the only field it needed to invent was `format` — which was
+# v2's `reserved:u16`, and 0 still means the LPCM16 it always meant. The rest is
+# the state an AX voice must be handed to decode: eight coefficient pairs of its
+# own, the first frame's header byte, and the two history samples to start from
+# (zero twice, since the encoder began in silence). `sampleCount` stays a count of
+# SAMPLES for both formats; the console converts to nibbles, because that
+# conversion is a property of the hardware and not of the file.
 #    0  magic 'CBNK' | 4 version | 8 count | 12 rate | 16 reserved[4]  = 32
 #   32  count x { name[24], offset, sampleCount, loopStart, cycleSamples,
 #                flags,
 #                attackMs:u16, decayMs:u16, sustain:u16 (per mille),
 #                releaseMs:u16, vibDelayMs:u16, vibRateMilliHz:u16,
-#                vibDepthCents:s16, reserved:u16 }                     = 60
-#       PCM16 payloads, 64-byte aligned, offsets from the start of file
+#                vibDepthCents:s16, format:u16,
+#                coefficients:s16[16], predScale:u16, yn1:s16, yn2:s16,
+#                loopPredScale:u16, loopYn1:s16, loopYn2:s16 }         = 104
+#       payloads, 64-byte aligned, offsets from the start of file
 BANK_HEADER_SIZE = 32
-BANK_ENTRY_SIZE = 60
+BANK_ENTRY_SIZE = 104
 BANK_FLAG_LOOPING = 1
+
+BANK_FORMAT_LPCM16 = 0
+BANK_FORMAT_ADPCM = 1
 
 
 def read_wav_mono16(path):
@@ -369,6 +382,49 @@ def cents(v):
     return _clamp(int(round(float(v))), -32768, 32767, "a vibrato depth")
 
 
+def encode_adpcm(inst, samples):
+    """Compress one instrument and work out the state a voice must start from.
+
+    The loop is the fiddly part and it is fiddly for a reason worth knowing: an
+    ADPCM sample is not decodable on its own. It is a correction to a prediction
+    made from the two samples before it, so jumping into the middle of a stream
+    means telling the hardware what those two samples were and which frame header
+    was in force. AX has fields for exactly that (`AXVoiceAdpcmLoopData`), and
+    they are filled in here by decoding up to the loop point with the console's
+    own arithmetic — not by guessing.
+    """
+    import adpcm
+
+    r = adpcm.encode(samples)
+    decoded = adpcm.decode(r["data"], len(samples), r["coefficients"],
+                           r["predScale"])
+    loop_start = int(inst.get("loopStart", 0))
+    if inst.get("loop"):
+        if loop_start % adpcm.FRAME_SAMPLES != 0:
+            raise SystemExit(
+                "%s: an ADPCM loop must start on a frame boundary (a multiple "
+                "of %d samples), and %d is not one. A frame carries its own "
+                "scale in a header byte, so there is nowhere else to enter it."
+                % (inst["name"], adpcm.FRAME_SAMPLES, loop_start))
+        header = r["data"][(loop_start // adpcm.FRAME_SAMPLES) *
+                           adpcm.FRAME_BYTES]
+        loop_yn1 = decoded[loop_start - 1] if loop_start >= 1 else 0
+        loop_yn2 = decoded[loop_start - 2] if loop_start >= 2 else 0
+    else:
+        header, loop_yn1, loop_yn2 = 0, 0, 0
+
+    return r["data"], {
+        "coefficients": r["coefficients"],
+        "predScale": r["predScale"],
+        "yn1": r["yn1"],
+        "yn2": r["yn2"],
+        "loopPredScale": header,
+        "loopYn1": loop_yn1,
+        "loopYn2": loop_yn2,
+        "snr": adpcm.snr_db(samples, decoded),
+    }
+
+
 def bake_bank(dst, manifest_path):
     with open(manifest_path) as fh:
         manifest = json.load(fh)
@@ -387,22 +443,28 @@ def bake_bank(dst, manifest_path):
         name = inst["name"].encode("ascii")
         if len(name) > 23:
             raise SystemExit("%s: name longer than 23 characters" % inst["name"])
-        # The samples are written big-endian: the console reads them as they
-        # are, and an AX voice is handed the file's own bytes.
-        swapped = b"".join(struct.pack(">h", v) for (v,) in
-                           struct.iter_unpack("<h", pcm))
-        entries.append((name, offset, swapped, inst))
-        offset += (len(swapped) + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
+        samples = [v for (v,) in struct.iter_unpack("<h", pcm)]
+
+        if inst.get("format", "lpcm16") == "adpcm":
+            payload, adpcm_info = encode_adpcm(inst, samples)
+        else:
+            # The samples are written big-endian: the console reads them as they
+            # are, and an AX voice is handed the file's own bytes. ADPCM needs no
+            # swap at all — nibbles inside a byte have no byte order.
+            payload = b"".join(struct.pack(">h", v) for v in samples)
+            adpcm_info = None
+        entries.append((name, offset, payload, inst, len(samples), adpcm_info))
+        offset += (len(payload) + PAK_ALIGN - 1) & ~(PAK_ALIGN - 1)
 
     total = offset
     with open(dst, "wb") as fh:
         fh.write(struct.pack(">4s3I4I", b"CBNK", BANK_VERSION, len(entries),
                              rate, 0, 0, 0, 0))
-        for name, off, pcm, inst in entries:
+        for name, off, payload, inst, count, adpcm_info in entries:
             flags = BANK_FLAG_LOOPING if inst.get("loop") else 0
             env = inst.get("envelope", {})
             vib = inst.get("vibrato", {})
-            fh.write(struct.pack(">24sIIIII", name, off, len(pcm) // 2,
+            fh.write(struct.pack(">24sIIIII", name, off, count,
                                  inst.get("loopStart", 0),
                                  inst.get("cycleSamples", 0), flags))
             # Sustain is written in thousandths because a fraction in a binary
@@ -414,13 +476,23 @@ def bake_bank(dst, manifest_path):
                                  ms(env.get("release", 0)),
                                  ms(vib.get("delay", 0)),
                                  milli_hz(vib.get("rate", 0.0)),
-                                 cents(vib.get("depth", 0)), 0))
-        for name, off, pcm, inst in entries:
+                                 cents(vib.get("depth", 0)),
+                                 BANK_FORMAT_ADPCM if adpcm_info
+                                 else BANK_FORMAT_LPCM16))
+            info = adpcm_info or {"coefficients": [0] * 16, "predScale": 0,
+                                  "yn1": 0, "yn2": 0, "loopPredScale": 0,
+                                  "loopYn1": 0, "loopYn2": 0}
+            fh.write(struct.pack(">16h", *info["coefficients"]))
+            fh.write(struct.pack(">HhhHhh", info["predScale"],
+                                 info["yn1"], info["yn2"],
+                                 info["loopPredScale"],
+                                 info["loopYn1"], info["loopYn2"]))
+        for name, off, payload, inst, count, adpcm_info in entries:
             fh.write(b"\0" * (off - fh.tell()))
-            fh.write(pcm)
+            fh.write(payload)
         fh.write(b"\0" * (total - fh.tell()))
 
-    for name, off, pcm, inst in entries:
+    for name, off, payload, inst, count, adpcm_info in entries:
         env, vib = inst.get("envelope"), inst.get("vibrato")
         shape = ""
         if env:
@@ -431,8 +503,14 @@ def bake_bank(dst, manifest_path):
         if vib and vib.get("depth"):
             shape += "  vib %.1f Hz %+d cents after %d ms" % (
                 vib.get("rate", 0.0), vib["depth"], vib.get("delay", 0))
+        if adpcm_info:
+            # The number that decides whether ADPCM was a good idea for this
+            # instrument, printed at every build so the decision stays a
+            # measurement instead of becoming a habit.
+            shape += "  ADPCM %d B, %.2f:1, SNR %.1f dB" % (
+                len(payload), count * 2.0 / len(payload), adpcm_info["snr"])
         print("    %-10s %7d samples%s%s%s" % (
-            name.decode(), len(pcm) // 2,
+            name.decode(), count,
             "  loop@%d" % inst.get("loopStart", 0) if inst.get("loop") else "",
             "  cycle %d" % inst["cycleSamples"] if inst.get("cycleSamples") else "",
             shape))

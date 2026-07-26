@@ -177,37 +177,53 @@ void CremaAudioShutdown(void)
 
 // --- sounds ------------------------------------------------------------------
 
-static bool soundCreate(CremaSound *snd, const int16_t *pcm, uint32_t count,
-                        uint32_t rate, uint32_t loopStart, bool looping)
+// A frame of ADPCM is eight bytes and holds fourteen samples, of which the first
+// two nibbles are not a sample at all but the frame's header. So a sample's
+// address is not its index, and this function is the whole difference — an ADPCM
+// voice pointed at sample offsets rather than nibble offsets plays static, while
+// every other thing about the setup looks correct.
+#define ADPCM_FRAME_SAMPLES 14
+#define ADPCM_FRAME_NIBBLES 16
+
+static uint32_t adpcmNibble(uint32_t sample)
 {
-    if (!snd || !pcm || count == 0)
+    return (sample / ADPCM_FRAME_SAMPLES) * ADPCM_FRAME_NIBBLES +
+           (sample % ADPCM_FRAME_SAMPLES) + 2;
+}
+
+static bool soundCreate(CremaSound *snd, const void *src, size_t bytes,
+                        uint32_t count, uint32_t rate, uint32_t loopStart,
+                        bool looping, uint8_t format)
+{
+    if (!snd || !src || count == 0 || bytes == 0)
         return false;
 
     memset(snd, 0, sizeof(*snd));
-    size_t bytes = (size_t)count * sizeof(int16_t);
     // 64-byte aligned so the flush below writes back our cache lines and
     // nothing else's — the buffer must not share a line with a live neighbour.
-    snd->samples = (int16_t *)memalign(64, (bytes + 63u) & ~(size_t)63);
-    if (!snd->samples)
+    snd->data = memalign(64, (bytes + 63u) & ~(size_t)63);
+    if (!snd->data)
         return false;
 
-    memcpy(snd->samples, pcm, bytes);
+    memcpy(snd->data, src, bytes);
     // The DSP reads memory directly. Everything we just wrote is still sitting
     // in the CPU's cache until this line, and a voice started before it would
     // play whatever was there before.
-    DCFlushRange(snd->samples, bytes);
+    DCFlushRange(snd->data, bytes);
 
     snd->count     = count;
     snd->rate      = rate ? rate : s_mixRate;
     snd->loopStart = loopStart;
     snd->looping   = looping;
+    snd->format    = format;
     return true;
 }
 
 bool CremaSoundCreate(CremaSound *snd, const int16_t *pcm, uint32_t count,
                       uint32_t rate)
 {
-    return soundCreate(snd, pcm, count, rate, 0, false);
+    return soundCreate(snd, pcm, (size_t)count * sizeof(int16_t), count, rate,
+                       0, false, CREMA_SOUND_LPCM16);
 }
 
 bool CremaSoundCreateLooping(CremaSound *snd, const int16_t *pcm, uint32_t count,
@@ -215,14 +231,30 @@ bool CremaSoundCreateLooping(CremaSound *snd, const int16_t *pcm, uint32_t count
 {
     if (loopStart >= count)
         loopStart = 0;
-    return soundCreate(snd, pcm, count, rate, loopStart, true);
+    return soundCreate(snd, pcm, (size_t)count * sizeof(int16_t), count, rate,
+                       loopStart, true, CREMA_SOUND_LPCM16);
+}
+
+bool CremaSoundCreateAdpcm(CremaSound *snd, const void *nibbles, size_t bytes,
+                           uint32_t count, uint32_t rate, uint32_t loopStart,
+                           bool looping, const CremaAdpcm *info)
+{
+    if (!info)
+        return false;
+    if (loopStart >= count || loopStart % ADPCM_FRAME_SAMPLES != 0)
+        loopStart = 0;
+    if (!soundCreate(snd, nibbles, bytes, count, rate, loopStart, looping,
+                     CREMA_SOUND_ADPCM))
+        return false;
+    snd->adpcm = *info;
+    return true;
 }
 
 void CremaSoundDestroy(CremaSound *snd)
 {
-    if (!snd || !snd->samples)
+    if (!snd || !snd->data)
         return;
-    free(snd->samples);
+    free(snd->data);
     memset(snd, 0, sizeof(*snd));
 }
 
@@ -300,7 +332,7 @@ static void applySound(struct CremaAudioVoice *slot, const CremaSound *snd,
                        float volume, float pitch)
 {
     AXVoice *v = slot ? slot->ax : NULL;
-    if (!v || !snd || !snd->samples || snd->count == 0)
+    if (!v || !snd || !snd->data || snd->count == 0)
         return;
     slot->rate = snd->rate;
 
@@ -319,18 +351,47 @@ static void applySound(struct CremaAudioVoice *slot, const CremaSound *snd,
     AXSetVoiceSrcType(v, AX_VOICE_SRC_TYPE_LINEAR);
     AXSetVoiceSrcRatio(v, pitchToRatio(snd->rate, pitch));
 
-    // Offsets are counted in samples for LPCM16, and endOffset is the last
-    // sample, not the one past it.
+    // Offsets are counted in samples for LPCM16 and in NIBBLES for ADPCM, and in
+    // both cases endOffset is the last sample rather than the one past it.
+    bool adpcm = snd->format == CREMA_SOUND_ADPCM;
     AXVoiceOffsets offs;
     memset(&offs, 0, sizeof(offs));
-    offs.dataType       = AX_VOICE_FORMAT_LPCM16;
+    offs.dataType       = adpcm ? AX_VOICE_FORMAT_ADPCM : AX_VOICE_FORMAT_LPCM16;
     offs.loopingEnabled = snd->looping ? AX_VOICE_LOOP_ENABLED
                                        : AX_VOICE_LOOP_DISABLED;
-    offs.loopOffset     = snd->looping ? snd->loopStart : 0;
-    offs.endOffset      = snd->count - 1;
-    offs.currentOffset  = 0;
-    offs.data           = snd->samples;
+    if (adpcm) {
+        offs.loopOffset    = snd->looping ? adpcmNibble(snd->loopStart) : 0;
+        offs.endOffset     = adpcmNibble(snd->count - 1);
+        offs.currentOffset = adpcmNibble(0);      // 2: past the first header
+    } else {
+        offs.loopOffset    = snd->looping ? snd->loopStart : 0;
+        offs.endOffset     = snd->count - 1;
+        offs.currentOffset = 0;
+    }
+    offs.data = snd->data;
     AXSetVoiceOffsets(v, &offs);
+
+    // After the offsets, not before: setting them for an LPCM format wipes the
+    // voice's ADPCM block (and fills in the gain that format wants), while for
+    // ADPCM it deliberately leaves it alone. Writing the decoder state second is
+    // what makes a retrigger start from silence instead of from wherever the
+    // previous note left the predictor.
+    if (adpcm) {
+        AXVoiceAdpcm ad;
+        memcpy(ad.coefficients, snd->adpcm.coefficients,
+               sizeof(ad.coefficients));
+        ad.gain          = 0;      // ADPCM carries its scale per frame instead
+        ad.predScale     = snd->adpcm.predScale;
+        ad.prevSample[0] = snd->adpcm.yn1;
+        ad.prevSample[1] = snd->adpcm.yn2;
+        AXSetVoiceAdpcm(v, &ad);
+
+        AXVoiceAdpcmLoopData loop;
+        loop.predScale     = snd->adpcm.loopPredScale;
+        loop.prevSample[0] = snd->adpcm.loopYn1;
+        loop.prevSample[1] = snd->adpcm.loopYn2;
+        AXSetVoiceAdpcmLoop(v, &loop);
+    }
 
     AXSetVoiceState(v, AX_VOICE_STATE_PLAYING);
     AXVoiceEnd(v);
@@ -338,7 +399,7 @@ static void applySound(struct CremaAudioVoice *slot, const CremaSound *snd,
 
 bool CremaAudioPlay(const CremaSound *snd, float volume, float pitch)
 {
-    if (!snd || !snd->samples)
+    if (!snd || !snd->data)
         return false;
     struct CremaAudioVoice *slot = acquireSlot(false);
     if (!slot)
@@ -349,7 +410,7 @@ bool CremaAudioPlay(const CremaSound *snd, float volume, float pitch)
 
 CremaAudioVoice *CremaAudioHold(const CremaSound *snd, float volume, float pitch)
 {
-    if (!snd || !snd->samples)
+    if (!snd || !snd->data)
         return NULL;
     struct CremaAudioVoice *slot = acquireSlot(true);
     if (slot)

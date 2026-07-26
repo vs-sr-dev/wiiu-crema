@@ -24,6 +24,7 @@
 
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -41,14 +42,45 @@ void CremaAudioShutdown(void);
 
 // --- sounds ------------------------------------------------------------------
 
-// 16-bit mono PCM in memory the DSP can read. Mono because an AX voice is mono:
+typedef enum {
+    CREMA_SOUND_LPCM16 = 0,
+    CREMA_SOUND_ADPCM  = 1,
+} CremaSoundFormat;
+
+// What an AX voice needs in order to decode ADPCM, and why a compressed sound
+// carries a struct where an uncompressed one carries nothing.
+//
+// Four bits per sample, decoded by the hardware at no cost — the DSP does ADPCM
+// and LPCM16 for the same price, so the 3.5:1 is paid entirely by the baker. What
+// it costs instead is *context*: a nibble is not a sample, it is a correction to
+// a prediction made from the two samples before it. So a voice cannot simply be
+// pointed at the data. It has to be told which eight second-order predictors this
+// instrument uses (chosen for its own material, offline, by tools/adpcm.py), the
+// header byte of the frame it is starting in, and the two samples of history to
+// predict from — zero twice at the beginning, because the encoder began in
+// silence and a voice that starts anywhere else decodes the first frame
+// differently from the way it was written.
+//
+// The loop needs the same three things again, for the same reason: jumping back
+// to a sample is jumping into the middle of a prediction.
+typedef struct {
+    int16_t  coefficients[16];   // eight (a1, a2) pairs, Q11
+    uint16_t predScale;          // the first frame's header: predictor<<4 | scale
+    int16_t  yn1, yn2;
+    uint16_t loopPredScale;
+    int16_t  loopYn1, loopYn2;
+} CremaAdpcm;
+
+// Mono audio in memory the DSP can read. Mono because an AX voice is mono:
 // stereo is two voices, and a game with a listener would rather pan one.
 typedef struct {
-    int16_t *samples;     // DSP-visible, cache-flushed, owned by the sound
-    uint32_t count;       // samples, not bytes
+    void    *data;        // DSP-visible, cache-flushed, owned by the sound
+    uint32_t count;       // SAMPLES, not bytes, whichever format this is
     uint32_t rate;        // the rate the data was written for
     uint32_t loopStart;   // sample to jump back to; ignored unless looping
     bool     looping;
+    uint8_t  format;      // a CremaSoundFormat
+    CremaAdpcm adpcm;     // meaningful only when format is CREMA_SOUND_ADPCM
 } CremaSound;
 
 // Copies `count` samples into a fresh DSP-visible buffer and flushes it.
@@ -59,6 +91,14 @@ bool CremaSoundCreate(CremaSound *snd, const int16_t *pcm, uint32_t count,
 // join back onto itself without a step, or you will hear the seam once per loop.
 bool CremaSoundCreateLooping(CremaSound *snd, const int16_t *pcm, uint32_t count,
                              uint32_t rate, uint32_t loopStart);
+
+// Same, from already-compressed nibbles. `count` is still a count of samples —
+// the conversion to nibble addresses is a property of the hardware, not of the
+// data, so it happens here and nowhere upstream. A loop must begin on a frame
+// boundary (a multiple of 14 samples); the baker refuses anything else.
+bool CremaSoundCreateAdpcm(CremaSound *snd, const void *nibbles, size_t bytes,
+                           uint32_t count, uint32_t rate, uint32_t loopStart,
+                           bool looping, const CremaAdpcm *info);
 
 void CremaSoundDestroy(CremaSound *snd);
 

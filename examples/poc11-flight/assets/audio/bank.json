@@ -82,6 +82,37 @@
       }
     },
     {
+      "name": "pwm",
+      "file": "pwm.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 3,
+        "decay": 210,
+        "sustain": 0.7,
+        "release": 130
+      },
+      "vibrato": {
+        "delay": 240,
+        "rate": 5.4,
+        "depth": 22
+      }
+    },
+    {
+      "name": "sync",
+      "file": "sync.wav",
+      "loop": true,
+      "loopStart": 0,
+      "cycleSamples": 32,
+      "envelope": {
+        "attack": 2,
+        "decay": 240,
+        "sustain": 0.55,
+        "release": 100
+      }
+    },
+    {
       "name": "noise",
       "file": "noise.wav",
       "loop": true,
@@ -106,14 +137,16 @@
       "file": "boom.wav",
       "loop": false,
       "loopStart": 0,
-      "cycleSamples": 0
+      "cycleSamples": 0,
+      "format": "adpcm"
     },
     {
       "name": "engine",
       "file": "engine.wav",
       "loop": true,
       "loopStart": 0,
-      "cycleSamples": 0
+      "cycleSamples": 0,
+      "format": "adpcm"
     }
   ]
 }

@@ -1,0 +1,41 @@
+{
+  "rate": 32000,
+  "instruments": [
+    {
+      "name": "kick",
+      "file": "kick.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "tap",
+      "file": "tap.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "whistle",
+      "file": "whistle.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "post",
+      "file": "post.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0
+    },
+    {
+      "name": "cheer",
+      "file": "cheer.wav",
+      "loop": false,
+      "loopStart": 0,
+      "cycleSamples": 0,
+      "format": "adpcm"
+    }
+  ]
+}

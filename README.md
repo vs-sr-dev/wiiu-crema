@@ -8,22 +8,25 @@
 Crema is a small, honest layer: runtime GLSL shaders, cache-safe resource
 handling, frame pacing, an audio stack that treats AX as what it is, and the
 hard-earned lessons of getting GX2 code from the Cemu emulator onto real
-silicon. It ships with thirteen progressive examples, each one verified on real
+silicon. It ships with fourteen progressive examples, each one verified on real
 hardware — a flyable game at 59.9 fps with the CPU idle and an engine note that
-follows the throttle, a shoot-'em-up you can actually lose, and a slice of a
+follows the throttle, a shoot-'em-up you can actually lose, a slice of a
 role-playing game whose field is still standing where you left it when the
-battle ends.
+battle ends, and a football match whose ball takes the same flight whether the
+console is idle or drowning.
 
 It started as a rendering framework and the word has quietly stopped being true.
-It is still not called an engine here, and that is now a decision rather than a
-gap. Both of the things that were named as standing in the way have gone: **it
-can save** — a high score survives the power going off — and **it knows what a
-scene is**, which is a lifetime and not a game state, verified by two different
-games. What is deliberately not being claimed is that this has been *asked*
-enough. Every example so far draws, shoots or walks; none of them has wanted a
-ball to bounce or a net to be see-through. A word earned by a checklist is worth
-less than one earned by something new refusing to fit, so the next slice comes
-first.
+It is still not called an engine here, and that is a decision rather than a gap.
+Everything that was named as standing in the way has now gone: **it can save** —
+a high score survives the power going off — **it knows what a scene is**, which
+is a lifetime and not a game state, verified by two different games, and the
+slice that was supposed to ask for something new has been built and has asked
+for it. A football wanted a ball that obeys physics rather than a script, a net
+you can see the players through, and a clock that is not the frame rate; it got
+all three, and none of them needed the framework changed to make room.
+
+What that leaves is not a checklist item. The word is one person's to claim and
+it has not been claimed here yet.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
@@ -168,6 +171,7 @@ handed back.
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
 | 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves, a record that survives the power going off — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs. Its four game states were later rewritten as four scenes, which is what made `crema_scene` more than one example's preference | 59.9 fps, 0.00 ms sync, save **47 ms on console** |
 | 13 | `poc13-quest` | a slice of a role-playing game, and the first thing here with two places: a field you walk, a battle pushed on top of it that leaves the field standing, a see-through status menu, a journal on the card and a hero who comes back to where they stood | 59.9 fps, 0.00 ms sync, **no frame dropped by any scene change** |
+| 14 | `poc14-kickoff` | a slice of a football match, and the first thing here whose clock is not the frame: eight stick figures assembled from three bricks, a ball with drag, spin and a bounce, goals with see-through nets, twenty thousand blades of grass, and a simulation stepping at 120 Hz under a 59.94 Hz picture | *console run pending* — 60.1 fps, 0.00 ms sync in Cemu, **the same kick lands on the same five decimals at 60 fps and at 38** |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -183,6 +187,8 @@ python tools/crema_bake.py mesh    assets/ship.obj content/ship.cmesh
 python tools/crema_bake.py texture assets/hull.png content/hull.ctex
 python tools/gen_font.py  examples/poc11-flight/assets/font.png
 python tools/crema_bake.py texture assets/font.png content/font.ctex --no-mips
+python tools/gen_bricks.py      examples/poc14-kickoff/assets   # box, sphere, wedge, grass, net
+python tools/gen_match_audio.py examples/poc14-kickoff/assets/audio
 ```
 
 The baker interleaves vertices into the exact layout the fetch shader wants,
@@ -1089,6 +1095,151 @@ by 150. Four scenes with a struct and five callbacks each are more code than a
 `switch` on an `int`, and for a game that is one place the `switch` was genuinely
 better. The shape earns its keep when there are two places with different
 lifetimes.
+
+### The clock is not the frame
+
+> Every number in this section and the next is from **Cemu**, and is marked as
+> such until the console has run it. Every other measurement in this file was
+> taken on hardware; these two sections are the only ones waiting, and the
+> project's own rule is that the emulator is not to be believed until it agrees.
+
+Every example before PoC 14 integrated against the frame: `pos += vel *
+clock.dt`, with `dt` whatever the last frame happened to take. That is fine for
+a ship being told where to go, and it stops being fine the moment something
+**bounces**. A restitution is applied at the instant of contact, and with a
+frame-length step the instant is wherever the frame happened to land — so the
+same kick reaches a different height depending on how busy the GPU was. No care
+taken in the bounce code fixes that, because the bug is in the clock.
+
+So the football gets its own: **120 steps a second, and the frame gets whatever
+is between two of them.**
+
+```c
+acc += clock.dt;                       // the frame's real, variable time
+while (acc >= SIM_DT && steps < 8) {
+    prev = cur;                        // one assignment, see below
+    worldStep(&cur, &stepInput, SIM_DT);
+    stepInput.pressed = 0;             // see below as well
+    acc -= SIM_DT;  steps++;
+}
+alpha = acc / SIM_DT;
+worldLerp(&prev, &cur, alpha, &view);  // what is drawn is neither state
+```
+
+**120 Hz rather than 60, deliberately.** The console presents at 59.94 Hz, not
+60, so an accumulator at 120 never settles into a tidy two-per-frame — measured
+over a run it does two, two, two, *three*: `steps avg 2.000 (1:2 2:1954 3:188)`.
+The awkward step is not a defect to tune away. It is the accumulator earning its
+keep, and the interpolation is what makes it invisible; `alpha` is a different
+number every frame, never 0 and never 1.
+
+**The claim, and how it is checked.** The example fires the same kick twice
+before the whistle — once with the console idle, once with 26 ms burned out of
+every frame — and prints where the ball is after exactly 240 steps:
+
+```
+PROBE quiet  at 60.1 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
+PROBE loaded at 38.2 fps | after 240 steps: pos 4.47762 0.20000 -19.14097 | vel 0.39313 0.00000 -5.85617
+```
+
+Five decimals, twenty-two frames per second apart. It runs on a timer rather
+than on a button, because a measurement that depends on somebody remembering to
+take it is a measurement nobody takes twice — and it is fenced off from the
+players, because twice in a row the two runs agreed only because nobody happened
+to reach the ball. Luck reported as a result is worse than no result.
+
+**Four things the fixed step forces, none of them obvious in advance:**
+
+- **The world goes in ONE struct.** Interpolating means keeping the previous
+  state as well as the current one, and the way that discipline rots is field by
+  field: somebody adds a velocity to a player and forgets the copy. With the
+  whole simulation in a single struct the previous state is `prev = cur` and
+  there is nothing left to forget. It costs a 400-byte copy at 120 Hz, which is
+  48 KB/s, which is nothing.
+- **An input edge belongs to exactly one step.** `pressed` is computed once per
+  *frame*; a frame that runs three steps hands the same button-down to all
+  three, and the ball gets kicked once, twice or three times depending on how
+  late the frame was. One line clears it after the first step. The bug is
+  invisible until it isn't.
+- **Durations are counted in steps, not seconds.** A countdown integrated
+  against a variable `dt` finishes at a different point in the simulation
+  depending on the frame rate, which puts the restart in a different place.
+- **An angle is not a number.** A player turning past the wrap point goes from
+  3.1 to −3.1 and a straight lerp spins him the long way through every heading
+  he does not have. Which is also why the walk phase is *never* wrapped: it is
+  interpolated, so it has to keep growing.
+
+And the runaway case — a frame so slow that catching up costs more than the
+frame did, forever — turned out to be already prevented, by accident.
+`CremaClockTick` clamps `dt` to 50 ms because coming back from the HOME menu
+hands you several seconds. Fifty milliseconds is six steps. **The guard that
+exists for the HOME menu is exactly the guard a fixed step needs**, and the
+`SIM_MAX_STEPS` in the loop above has never fired.
+
+### A net, a ball and twenty thousand blades
+
+Three firsts in one example, and each one turned out to be cheaper than
+expected and to have one sharp edge.
+
+**Transparency that is not against the sky.** PoC 11's billboards were
+see-through against a background; a goal net is see-through against the players
+standing behind it, and against *itself* — the far panel is visible through the
+near one. Depth test on and depth write off is what `crema_blend` had been
+saying all along, and here it is load-bearing rather than tidy: with depth
+writes the goal reads as a solid box. Culling comes off too, because a net has
+two sides. The cord is a **texture with a mip chain**, not a grid drawn with a
+`smoothstep`, and that is PoC 9's lesson arriving in a new costume: a regular
+pattern, minified, at a shallow angle is what moiré is made of, and a mip chain
+that averages *alpha* gives a net that fades into a haze at distance instead of
+crawling.
+
+**A ball has panels, not spots.** A football is a truncated icosahedron —
+twelve pentagons and twenty hexagons, white, with a black seam where two meet.
+Painting twelve dark patches is easier and wrong: it gives a ball with spots.
+So the panels are *found*: take the 32 panel centres (the icosahedron's twelve
+vertices and its twenty face centres) and ask which is nearest. That is a
+Voronoi diagram on the sphere and its cells are the panels; the seam is where
+the nearest two are too close to call. Thirty-two sites cost sixteen dot
+products, because they come in antipodal pairs. All of it against the
+**object-space** normal, so the pattern turns with the ball — which is the only
+thing on screen that shows a ball is spinning.
+
+**A stick figure is three meshes, not one.** Nothing in this example is
+modelled. A player is a box, a sphere and a wedge at eleven different sizes,
+368 baked triangles serving eighty-eight limbs. That is why the instance block
+carries a full 3×4 transform this time rather than PoC 13's position-and-yaw: a
+limb swings about a joint that is itself swinging. Normals survive the
+non-uniform scale without a second matrix — the transform is known to be R·S
+with R orthonormal, so **normalising the columns hands the rotation straight
+back**, three `normalize()` calls against 25% more instance bandwidth.
+
+**Grass costs nothing and the obvious optimisation was the bug.** 19,928
+blades, one triangle each, opaque and tapered so there is no alpha to blend and
+nothing to sort: 59.9 fps, unchanged. The first version had the patch follow
+the camera, snapped to the blade spacing — PoC 11's ground trick, which works
+because *a tiling texture is the same at every offset*. A jittered grid is not.
+Shift it by one cell and every blade lands where its neighbour was, and the
+neighbour is a different blade with a different height, lean and colour: the
+whole field re-rolls itself as the camera pans, which reads exactly like grass
+sliding along with you. It does not follow anything now. The pitch is sixty
+metres long and the entire visible field fits in one buffer under the **65,535
+vertex ceiling a 16-bit index buffer imposes**, which is the real constraint and
+the reason the spacing is what it is.
+
+### What was NOT extracted, and why
+
+Nothing. `crema/` is unchanged by this example — not one line — and that is the
+result rather than an omission. A football is one place, so its four phases are
+a `switch` and not a scene stack, which is what `crema_scene`'s own header
+advises for exactly this case. The rig, the ball, the AI and the grass have one
+caller each, and the project's rule is that a second caller is what authorises
+an extraction. The fixed step in particular *looks* extractable and is not: it
+is ten lines and a discipline, and `CremaClock` already does the only part of it
+that is not the game's business.
+
+The one thing that now has two callers is a suspicion rather than a conclusion:
+`prev`/`cur` interpolation and a per-entity velocity array are both sitting in
+more than one example. Both are being left alone until something demands them.
 
 ## Lessons learned (Cemu vs real hardware)
 

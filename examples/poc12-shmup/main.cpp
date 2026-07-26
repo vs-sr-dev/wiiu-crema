@@ -32,6 +32,7 @@
 #include <whb/gfx.h>
 #include <whb/log.h>
 #include <vpad/input.h>
+#include <coreinit/time.h>
 #include <math.h>
 #include <string.h>
 
@@ -49,6 +50,7 @@
 #include "crema_mesh.h"
 #include "crema_music.h"
 #include "crema_pak.h"
+#include "crema_save.h"
 #include "crema_shader.h"
 #include "crema_texture.h"
 
@@ -172,6 +174,25 @@ typedef struct {
     float time[4];
 } GlobalBlock;
 
+// --- the record --------------------------------------------------------------
+//
+// The one part of this game that is supposed to outlive the process. It was in
+// RAM until now, which meant the "BEST" line on the HUD was a lie the moment you
+// pressed HOME — it said "best" and meant "best since you turned it on".
+//
+// Two fields rather than one on purpose. A high score alone would be indistinct
+// from a single word written to a file, and the thing worth proving is that a
+// *struct* goes out and comes back with its parts still in the right order; a
+// play counter is also the honest way to see, from the title screen, that the
+// last session really happened.
+#define RECORD_FILE    "record.dat"
+#define RECORD_VERSION 1
+
+typedef struct {
+    uint32_t best;
+    uint32_t games;
+} Record;
+
 // --- the game ----------------------------------------------------------------
 
 enum { STATE_TITLE, STATE_PLAY, STATE_PAUSED, STATE_OVER };
@@ -192,7 +213,7 @@ typedef struct {
     CremaEffect     fxStorage[MAX_EFFECTS];
 
     int      state;
-    uint32_t score, best;
+    uint32_t score, best, games;
     int      lives;
     float    invuln;         // after a death: visible, blinking, unhittable
     float    fireCooldown;
@@ -257,6 +278,24 @@ static void resetRound(Game *g)
     Vec3 start = { 0.0f, 0.0f, FIELD_NEAR - 4.0f };
     Vec3 still = { 0.0f, 0.0f, 0.0f };
     spawn(g, KIND_PLAYER, start, still, PLAYER_RADIUS, 0.0f);
+}
+
+// Written once per game over, and timed because a file on the SD card is the
+// slowest thing this program does on purpose and it happens while a frame is in
+// flight. If it costs milliseconds it belongs on another thread; if it costs
+// microseconds the simplest possible code is also the right one, and the only
+// way to know which is to print the number.
+static void persistRecord(Game *g)
+{
+    Record rec;
+    rec.best  = g->best;
+    rec.games = g->games;
+
+    uint64_t before = OSGetSystemTime();
+    bool ok = CremaSaveWrite(RECORD_FILE, RECORD_VERSION, &rec, sizeof(rec));
+    uint32_t us = (uint32_t)OSTicksToMicroseconds(OSGetSystemTime() - before);
+    WHBLogPrintf("[poc12] record %s: best %u, %u games, %u us",
+                 ok ? "saved" : "NOT saved", rec.best, rec.games, us);
 }
 
 static CremaEntity *findPlayer(Game *g)
@@ -407,6 +446,11 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
                 CremaEntityDespawn(&g->pool, player);
                 if (g->score > g->best)
                     g->best = g->score;
+                g->games++;
+                // Here and nowhere else. A game that saved every time the score
+                // changed would write to the card a hundred times a minute for
+                // one number that only matters when the round is over.
+                persistRecord(g);
                 g->state = STATE_OVER;
                 g->stateTime = 0.0f;
             } else {
@@ -535,6 +579,11 @@ static void buildHud(const Game *g, HudList *hud)
         // reads as an invitation
         if (fmodf(g->stateTime, 1.0f) < 0.6f)
             hudText(hud, 470.0f, 430.0f, 24.0f, "PRESS A", 0.9f, 0.9f, 0.9f, 1.0f);
+        // The proof that the save worked, and the reason it is on the title
+        // screen: a number that is not zero on a fresh boot came from a file.
+        hudText(hud, 500.0f, 520.0f, 18.0f, "GAMES", 0.5f, 0.6f, 0.75f, 0.85f);
+        hudNumber(hud, 580.0f, 520.0f, 18.0f, g->games, 4,
+                  0.7f, 0.8f, 0.95f, 0.85f);
         break;
     case STATE_PAUSED:
         hudRect(hud, 0.0f, 300.0f, 1280.0f, 120.0f, 0.0f, 0.0f, 0.0f, 0.55f);
@@ -562,6 +611,9 @@ int main(int argc, char **argv)
     if (!CremaAppInit("poc12-shmup"))
         return -1;
     CremaAudioInit();                  // before the assets: it ends the menu music
+    // Not fatal. A game that cannot find a card is a game with no record, and
+    // that is exactly how this PoC behaved yesterday.
+    bool canSave = CremaSaveInit("gx2poc");
     if (!CremaShaderInitCompiler()) {
         CremaAppShutdown();
         return -1;
@@ -661,6 +713,23 @@ int main(int argc, char **argv)
     CremaEntityPoolInit(&game.pool, game.storage, MAX_ENTITIES);
     CremaEffectPoolInit(&game.fx, game.fxStorage, MAX_EFFECTS);
     game.state = STATE_TITLE;
+
+    if (canSave) {
+        Record rec;
+        uint64_t before = OSGetSystemTime();
+        size_t got = CremaSaveRead(RECORD_FILE, RECORD_VERSION,
+                                   &rec, sizeof(rec));
+        uint32_t us = (uint32_t)OSTicksToMicroseconds(OSGetSystemTime() - before);
+        if (got == sizeof(rec)) {
+            game.best  = rec.best;
+            game.games = rec.games;
+            WHBLogPrintf("[poc12] record loaded from %s: best %u after %u "
+                         "games, %u us", CremaSaveDir(), rec.best, rec.games, us);
+        } else {
+            WHBLogPrintf("[poc12] no record yet in %s (%u us)",
+                         CremaSaveDir(), us);
+        }
+    }
 
     // The camera never moves. A shoot-'em-up is a 3D scene photographed from
     // one place forever, and every frame it does not recompute is a frame that
@@ -810,6 +879,7 @@ int main(int argc, char **argv)
     CremaShaderFree(shShip);
     CremaShaderShutdownCompiler();
     CremaAudioShutdown();
+    CremaSaveShutdown();
     CremaAppShutdown();
     return 0;
 }

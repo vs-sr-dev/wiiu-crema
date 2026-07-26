@@ -20,6 +20,7 @@ add_library(crema STATIC
     crema/crema_mesh.c
     crema/crema_music.c
     crema/crema_pak.c
+    crema/crema_save.c
     crema/crema_shader.cpp
     crema/crema_texture.c
 )

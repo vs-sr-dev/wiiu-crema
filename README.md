@@ -40,7 +40,10 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 ## What the engine provides (`crema/`)
 
 - **crema_app** — ProcUI lifecycle, UDP + Cemu logging, per-second frame
-  stats (fps / frame ms / GPU-drain ms)
+  stats (fps / frame ms / GPU-drain ms), and a startup line naming the render
+  targets it was handed, because WHBGfx sizes them from the console's own
+  display setting and a benchmark that assumes 720p on a 1080p console
+  publishes a number 2.25× too low — which this one did
 - **crema_shader** — runtime GLSL → Latte compilation via
   [CafeGLSL](https://github.com/Exzap/CafeGLSL), fetch-shader construction,
   VS/PS uniform-block reflection, big-endian-safe uniform upload
@@ -823,7 +826,9 @@ twice per frame — once for the television, once for the GamePad's tactical
 screen — with two different lists, both in flight at once. A uniform buffer
 inside the renderer would have to be overwritten between the two draws, and the
 first would read the second one's list. Whoever knows how many lists a frame has
-must own the storage for them, and that is never the framework.
+must own the storage for them, and that is never the engine. PoC 14 hit the
+same case a third time without anybody having to think about it, which is what
+a settled interface looks like.
 
 **A module asks for the numbers it needs, not for "the Global block".** PoC 11's
 global uniforms have ten fields; PoC 12's have three. A billboard renderer that

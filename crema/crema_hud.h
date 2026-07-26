@@ -23,7 +23,12 @@
 // TV renders it 1:1 and the GamePad squeezes the same layout into 854x480, so
 // the HUD is authored once and reads the same on both.
 //
-// Nothing here knows what a Wii U is.
+// The file has two halves and the line between them is worth keeping. The list
+// builder below knows nothing about a Wii U — it is arithmetic on floats, and a
+// layout can be checked without a console anywhere near it. The renderer at the
+// bottom is the opposite: it owns a compiled shader, a quad and a draw call.
+// They live together because a list nobody can draw is not a feature, but only
+// one of them has to be on this machine.
 
 #pragma once
 #include <stdint.h>
@@ -120,3 +125,54 @@ static void hudBar(HudList *hud, float x, float y, float w, float h,
     hudRect(hud, x, y, w * fill, h, r, g, b, 0.95f);
     hudFrame(hud, x, y, w, h, 1.0f, r * 0.8f, g * 0.8f, b * 0.8f, 0.8f);
 }
+
+// --- the renderer ------------------------------------------------------------
+//
+// The first thing in Crema that owns GPU state. It exists because two examples
+// wrote the same shader, the same unit quad and the same eight lines of draw
+// call, which is the point at which a thing stops being example code.
+//
+// What it deliberately does NOT own is the uniform storage. That is not
+// squeamishness about allocation: a frame draws the HUD twice, once for the
+// television and once for the GamePad, with two different lists, and both draws
+// are in flight at the same time — so a single buffer inside the renderer would
+// have to be overwritten between them and the first draw would read the second
+// list. Whoever knows how many lists a frame has must own the memory for them,
+// and that is the game, not this.
+
+#include <gx2/sampler.h>
+#include <gx2/texture.h>
+#include <gx2r/buffer.h>
+
+#include "crema_shader.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// What one HudList occupies in a uniform block — the size to hand
+// CremaUniformRingCreate.
+#define CREMA_HUD_BLOCK_BYTES (sizeof(float) * 4 * 2 * HUD_MAX_ITEMS)
+
+typedef struct {
+    CremaShader *shader;
+    GX2RBuffer   quad;        // the unit square, measured from its corner
+    GX2RBuffer   indices;
+    int32_t      blockLoc;
+    uint32_t     texUnit;
+} CremaHudRenderer;
+
+bool CremaHudRendererCreate(CremaHudRenderer *r);
+void CremaHudRendererDestroy(CremaHudRenderer *r);
+
+// One instanced draw of `count` items, from a uniform block the caller has
+// already stored. Alpha blended, no depth, no culling — and it puts the state
+// back the way it found it, because a HUD is drawn last and everything after it
+// is next frame's world.
+void CremaHudDraw(const CremaHudRenderer *r, const void *itemsUbo,
+                  uint32_t count, const GX2Texture *font,
+                  const GX2Sampler *sampler);
+
+#ifdef __cplusplus
+}
+#endif

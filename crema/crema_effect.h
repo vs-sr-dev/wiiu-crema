@@ -54,6 +54,51 @@ void CremaEffectUpdate(CremaEffectPool *pool, float dt);
 uint32_t CremaEffectPack(const CremaEffectPool *pool, float (*out)[4],
                          uint32_t maxEffects);
 
+// --- drawing them ------------------------------------------------------------
+//
+// A camera-facing quad per effect, additively blended, with the blob computed
+// from the corner coordinate — no sprite sheet, no texture fetch, and it never
+// shows its square edges. Two examples wrote this shader identically before it
+// moved here.
+//
+// The renderer asks for exactly three numbers rather than reading an
+// application's Global block, and that is the whole design of it. PoC 11's
+// Global has ten fields and PoC 12's has five; a module that wanted "the Global
+// block" would be a module that dictates the uniform layout of every game built
+// on it. So it declares its own, the caller fills it, and the two never have to
+// agree about anything else.
+
+#include <gx2/sampler.h>
+#include <gx2r/buffer.h>
+
+#include "crema_shader.h"
+
+// Effects drawn in one call. The pool may hold more; pack no more than this.
+#define CREMA_EFFECT_MAX_DRAWN 64
+#define CREMA_EFFECT_BLOCK_BYTES (sizeof(float) * 4 * 2 * CREMA_EFFECT_MAX_DRAWN)
+
+typedef struct {
+    Mat4  viewProj;
+    float camRight[4];   // the camera's basis, so a flat quad can face it
+    float camUp[4];
+} CremaEffectView;
+
+typedef struct {
+    CremaShader *shader;
+    GX2RBuffer   quad;        // the unit square measured from its centre
+    GX2RBuffer   indices;
+    int32_t      viewLoc, fxLoc;
+} CremaEffectRenderer;
+
+bool CremaEffectRendererCreate(CremaEffectRenderer *r);
+void CremaEffectRendererDestroy(CremaEffectRenderer *r);
+
+// Additive, depth tested but not depth written — overlapping billboards must
+// not carve holes in each other — and culling off, because a camera-facing quad
+// has no reliable winding. Both uniform blocks are the caller's storage.
+void CremaEffectDraw(const CremaEffectRenderer *r, const void *viewUbo,
+                     const void *fxUbo, uint32_t count);
+
 #ifdef __cplusplus
 }
 #endif

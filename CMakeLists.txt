@@ -13,6 +13,7 @@ add_library(crema STATIC
     crema/crema_buffer.c
     crema/crema_effect.c
     crema/crema_frame.c
+    crema/crema_hud.c
     crema/crema_collide.c
     crema/crema_entity.c
     crema/crema_input.c

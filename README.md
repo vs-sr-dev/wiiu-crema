@@ -35,9 +35,16 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 - **crema_blend** — blend mode (opaque / alpha / additive) and depth as two
   calls, with test and write as separate switches: the transparent pass wants
   test on and write off, or overlapping billboards punch holes in each other
+- **crema_hud** — the readout as a list of quads drawn in one instanced call: a
+  letter, a bar and a radar blip are the same quad with different numbers, and
+  one negative number is the entire difference between text and geometry. The
+  list builder knows nothing about a Wii U; the renderer beside it owns the
+  shader and the quad
 - **crema_effect** — timed billboard effects (flashes, tracers, explosions).
   What separates an effect from an entity is that an effect knows it is going
-  to die: it carries its own lifetime and packs itself into an instance array
+  to die: it carries its own lifetime and packs itself into an instance array —
+  and now draws itself, asking for three numbers about the camera rather than
+  for the application's uniform layout
 - **crema_input** — GamePad polling with rescaled dead zones and, the part that
   matters, edge-triggered buttons: `held` fires a gun sixty times a second
 - **crema_entity** — a pool of world objects over caller-owned storage, so
@@ -100,6 +107,7 @@ while (CremaAppRunning()) {
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
+| 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs | 59.9 fps, 0.00 ms sync |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -464,6 +472,49 @@ console, with the echo's return accounting for another 25% on top of that.
 The general lesson is not about this game. **A mixer that only adds has no idea
 how loud it is**, and neither does anyone reading the code; the number was
 available all along from hardware that was already summing it for us.
+
+### What a second game is for
+
+Nothing in `crema/` was designed. Every module was extracted from an example
+that had already written it, usually twice — which sounds like discipline and
+was, for eleven PoCs, mostly luck: they were all variations on "draw a thing",
+so "a second example needs this" was never a hard question. PoC 12 is a
+shoot-'em-up, and it was written **from an empty file** for exactly that reason.
+A second example cloned from the first is not a witness. Reuse `crema/` freely,
+reuse the baked assets freely, and copy nothing else — then the things you find
+yourself reaching back for are the answer.
+
+It answered within an hour. The HUD list builder was wanted *unchanged*, so it
+became `crema_hud.h`. Then two more things turned out to be duplicated, and both
+had the same shape:
+
+> **`crema/` held the data and the examples held the drawing.** The effect pool
+> was a module and the shader that puts it on screen was copied. The HUD builder
+> was a module and the shader that puts it on screen was copied.
+
+So `crema_hud` and `crema_effect` grew a renderer, the first things in Crema to
+own GPU state. Two decisions made that possible, and both were forced by the two
+examples disagreeing:
+
+**The renderer owns the shader; the game owns the memory.** PoC 11 draws its HUD
+twice per frame — once for the television, once for the GamePad's tactical
+screen — with two different lists, both in flight at once. A uniform buffer
+inside the renderer would have to be overwritten between the two draws, and the
+first would read the second one's list. Whoever knows how many lists a frame has
+must own the storage for them, and that is never the framework.
+
+**A module asks for the numbers it needs, not for "the Global block".** PoC 11's
+global uniforms have ten fields; PoC 12's have three. A billboard renderer that
+read the application's Global block would be a module that dictates the uniform
+layout of every game built on it. `CremaEffectDraw` declares its own three —
+view-projection, camera right, camera up — and the caller fills them. The same
+shader now serves a camera that never moves and a camera that never stops, and
+the two never have to agree about anything else.
+
+The cost of the extraction, measured: PoC 11 lost 150 lines, PoC 12 lost 118,
+`crema/` gained 142 that both share, and on hardware nothing changed at all —
+59.9 fps, 0.00 ms sync, the echo still 12-13 µs. What is left in each example is
+the one shader that game actually invented.
 
 ### What loading actually costs (measured on console)
 

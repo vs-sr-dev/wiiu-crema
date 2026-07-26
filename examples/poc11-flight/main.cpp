@@ -155,100 +155,6 @@ static const char *VS_ENEMY =
 // Billboards: a quad spun to face the camera using the camera's own right and
 // up axes. One draw covers tracers, muzzle flashes and explosions — they only
 // differ by colour, size and how long they live.
-static const char *VS_FX =
-    "#version 450\n"
-    "layout(location = 0) in vec2 aCorner;\n"   // -1..1 square
-    GLOBAL_UBO_DECL
-    "layout(binding = 1) uniform Effects {\n"
-    "    vec4 uFx[128];\n"   // 64 x { xyz = position, w = size }, { rgb, alpha }
-    "};\n"
-    "layout(location = 0) out vec2 vCorner;\n"
-    "layout(location = 1) out vec4 vTint;\n"
-    "void main()\n"
-    "{\n"
-    "    vec4 ps  = uFx[gl_InstanceID * 2];\n"
-    "    vec4 col = uFx[gl_InstanceID * 2 + 1];\n"
-    "    vec3 world = ps.xyz + uCamRight.xyz * (aCorner.x * ps.w)\n"
-    "                        + uCamUp.xyz    * (aCorner.y * ps.w);\n"
-    "    gl_Position = uViewProj * vec4(world, 1.0);\n"
-    "    vCorner = aCorner;\n"
-    "    vTint = col;\n"
-    "}\n";
-
-static const char *PS_FX =
-    "#version 450\n"
-    "layout(location = 0) in vec2 vCorner;\n"
-    "layout(location = 1) in vec4 vTint;\n"
-    "layout(location = 0) out vec4 oColor;\n"
-    "void main()\n"
-    "{\n"
-    // a soft round blob computed from the corner coordinate: no sprite sheet,
-    // no texture fetch, and it never shows its square edges
-    "    float d = length(vCorner);\n"
-    "    float falloff = 1.0 - smoothstep(0.15, 1.0, d);\n"
-    "    oColor = vec4(vTint.rgb * falloff, vTint.a * falloff);\n"
-    "}\n";
-
-// The HUD: one instanced quad per letter, bar and blip. It reads its position
-// in a virtual 1280x720 space and maps that to clip space itself, so the same
-// layout lands identically on the 720p TV and the 854x480 GamePad — the screens
-// differ in resolution, not in where things are.
-static const char *VS_HUD =
-    "#version 450\n"
-    "layout(location = 0) in vec2 aCorner;\n"    // 0..1 square
-    "layout(binding = 0) uniform Hud {\n"
-    "    vec4 uItem[512];\n"   // 256 x { x, y, w, glyph-or-negative-height }, rgba
-    "};\n"
-    "layout(location = 0) out vec2 vUV;\n"
-    "layout(location = 1) out vec4 vTint;\n"
-    "layout(location = 2) out float vSolid;\n"
-    "layout(location = 3) out vec4 vCell;\n"   // the cell's texel-centre bounds
-    "void main()\n"
-    "{\n"
-    "    vec4 it  = uItem[gl_InstanceID * 2];\n"
-    "    vec4 col = uItem[gl_InstanceID * 2 + 1];\n"
-    // a negative fourth component means "not a glyph": a solid rectangle whose
-    // height is the magnitude. One sign bit separates text from geometry.
-    "    float solid = it.w < 0.0 ? 1.0 : 0.0;\n"
-    "    vec2 size = solid > 0.5 ? vec2(it.z, -it.w) : vec2(it.z, it.z);\n"
-    "    vec2 pos = it.xy + aCorner * size;\n"
-    "    gl_Position = vec4(pos.x / 640.0 - 1.0,\n"     // 640 = 1280/2
-    "                       1.0 - pos.y / 360.0, 0.0, 1.0);\n"
-    // the atlas is 8x8 cells starting at ASCII 32, so the cell is two
-    // divisions of the index and there is no lookup table anywhere
-    "    float idx = max(it.w, 0.0);\n"
-    "    vec2 cell = vec2(mod(idx, 8.0), floor(idx * 0.125));\n"
-    // The coordinate runs edge to edge, so the glyph fills its quad; the
-    // fragment shader then clamps it inside the cell's outermost texel
-    // CENTRES. Both halves are needed and neither alone works: stop at the
-    // edges and the filter drags in the first row of the glyph in the next
-    // cell down (a phantom underscore under half the alphabet); shrink the
-    // coordinate to the centres instead and the glyph's own first row lands
-    // under-weighted, which reads as a top row shaved off.
-    "    vUV = (cell + aCorner) * 0.125;\n"          // 8 cells across the atlas
-    "    vCell = (vec4(cell, cell) * 16.0 + vec4(0.5, 0.5, 15.5, 15.5))\n"
-    "            * (1.0 / 128.0);\n"                 // 16 texels per cell, 128 wide
-    "    vTint = col;\n"
-    "    vSolid = solid;\n"
-    "}\n";
-
-static const char *PS_HUD =
-    "#version 450\n"
-    "layout(location = 0) in vec2 vUV;\n"
-    "layout(location = 1) in vec4 vTint;\n"
-    "layout(location = 2) in float vSolid;\n"
-    "layout(location = 3) in vec4 vCell;\n"
-    "layout(binding = 0) uniform sampler2D uFont;\n"
-    "layout(location = 0) out vec4 oColor;\n"
-    "void main()\n"
-    "{\n"
-    // clamped to the cell's outermost texel centres: the filter can reach the
-    // edge of this glyph and never past it
-    "    vec2 uv = clamp(vUV, vCell.xy, vCell.zw);\n"
-    "    float mask = vSolid > 0.5 ? 1.0 : texture(uFont, uv).a;\n"
-    "    oColor = vec4(vTint.rgb, vTint.a * mask);\n"
-    "}\n";
-
 static const char *VS_GROUND =
     "#version 450\n"
     "layout(location = 0) in vec3 aPosition;\n"
@@ -293,23 +199,11 @@ typedef struct {
     float fogColor[4];
     float time[4];
     float groundOffset[4];
-    float camRight[4];
-    float camUp[4];
 } GlobalBlock;
 
 // --- billboard quad -----------------------------------------------------------
 
 #define MAX_EFFECTS 64
-static const float FX_VERTS[] = { -1.0f, -1.0f,  1.0f, -1.0f,
-                                   1.0f,  1.0f, -1.0f,  1.0f };
-static const uint16_t FX_TRIS[] = { 0, 1, 2, 0, 2, 3 };
-#define FX_STRIDE (2 * sizeof(float))
-
-// The HUD quad is the same square measured from its corner instead of its
-// centre: 2D layout puts things at a top-left, not around a middle.
-static const float HUD_VERTS[] = { 0.0f, 0.0f,  1.0f, 0.0f,
-                                   1.0f, 1.0f,  0.0f, 1.0f };
-#define HUD_STRIDE (2 * sizeof(float))
 
 // --- ground ------------------------------------------------------------------
 
@@ -362,21 +256,17 @@ typedef struct {
     const void *enemyUbo;
     size_t   enemyBytes;
     uint32_t enemyCount;
-    const CremaShader *shFx;
-    GX2RBuffer *fxVbo, *fxIbo;
-    int32_t  gVsFx, fxLoc;
-    const void *fxUbo;
-    size_t   fxBytes;
+    // The billboards and the HUD are drawn by crema/ now. What stayed here is
+    // the storage they read, because a frame draws the HUD twice — once per
+    // screen, with two different lists, both in flight at once — and only this
+    // file knows that.
+    const CremaEffectRenderer *fxRenderer;
+    const void *fxViewUbo, *fxUbo;
     uint32_t fxCount;
-    // the HUD, which is the only thing that differs between the two screens
-    const CremaShader *shHud;
-    GX2RBuffer *hudVbo, *hudIbo;
-    int32_t  hudLoc;
-    uint32_t fontUnit;
+    const CremaHudRenderer *hudRenderer;
     const GX2Texture *font;
     const GX2Sampler *fontSampler;
     const void *hudUbo;
-    size_t   hudBytes;
     uint32_t hudCount;
 } SceneView;
 
@@ -415,24 +305,8 @@ static void drawWorld(void *user)
         CremaMeshDraw(s->ship, s->enemyCount);
     }
 
-    // Transparent pass, last: additive, depth test on, depth writes OFF so
-    // overlapping billboards do not carve holes in each other. Culling off
-    // too — a camera-facing quad has no reliable winding.
-    if (s->fxCount > 0) {
-        CremaBlendSet(CREMA_BLEND_ADDITIVE);
-        CremaDepthSet(true, false);
-        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
-
-        CremaShaderBind(s->shFx);
-        GX2SetVertexUniformBlock(s->gVsFx, sizeof(GlobalBlock), s->globalUbo);
-        GX2SetVertexUniformBlock(s->fxLoc, s->fxBytes, s->fxUbo);
-        GX2RSetAttributeBuffer(s->fxVbo, 0, FX_STRIDE, 0);
-        GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->fxIbo,
-                        GX2_INDEX_TYPE_U16, 6, 0, 0, s->fxCount);
-
-        CremaBlendSet(CREMA_BLEND_OPAQUE);
-        CremaDepthSet(true, true);
-    }
+    // Transparent pass, last.
+    CremaEffectDraw(s->fxRenderer, s->fxViewUbo, s->fxUbo, s->fxCount);
 }
 
 // The HUD pass: alpha blended, no depth at all, culling off. It is the last
@@ -441,23 +315,8 @@ static void drawWorld(void *user)
 static void drawHud(void *user)
 {
     const SceneView *s = (const SceneView *)user;
-    if (s->hudCount == 0)
-        return;
-
-    CremaBlendSet(CREMA_BLEND_ALPHA);
-    CremaDepthSet(false, false);
-    GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
-
-    CremaShaderBind(s->shHud);
-    GX2SetVertexUniformBlock(s->hudLoc, s->hudBytes, s->hudUbo);
-    GX2SetPixelTexture(s->font, s->fontUnit);
-    GX2SetPixelSampler(s->fontSampler, s->fontUnit);
-    GX2RSetAttributeBuffer(s->hudVbo, 0, HUD_STRIDE, 0);
-    GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, s->hudIbo,
-                    GX2_INDEX_TYPE_U16, 6, 0, 0, s->hudCount);
-
-    CremaBlendSet(CREMA_BLEND_OPAQUE);
-    CremaDepthSet(true, true);
+    CremaHudDraw(s->hudRenderer, s->hudUbo, s->hudCount, s->font,
+                 s->fontSampler);
 }
 
 // --- the rival squadron -------------------------------------------------------
@@ -780,21 +639,19 @@ int main(int argc, char **argv)
     const CremaAttrib fxAttribs[] = {
         { 0, 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32 },
     };
-    CremaShader *shFx = CremaShaderCompile(VS_FX, PS_FX, fxAttribs, 1);
-    CremaShader *shHud = CremaShaderCompile(VS_HUD, PS_HUD, fxAttribs, 1);
-    if (!shShip || !shGround || !shEnemy || !shFx || !shHud) {
+    CremaEffectRenderer fxRenderer;
+    CremaHudRenderer    hudRenderer;
+    if (!shShip || !shGround || !shEnemy ||
+        !CremaEffectRendererCreate(&fxRenderer) ||
+        !CremaHudRendererCreate(&hudRenderer)) {
         CremaShaderShutdownCompiler();
         CremaAppShutdown();
         return -1;
     }
 
-    GX2RBuffer groundVbo, groundIbo, fxVbo, fxIbo, hudVbo, hudIbo;
+    GX2RBuffer groundVbo, groundIbo;
     CremaBufferCreateVertex(&groundVbo, GROUND_STRIDE, 4, GROUND_VERTS);
     CremaBufferCreateIndexU16(&groundIbo, 6, GROUND_TRIS);
-    CremaBufferCreateVertex(&fxVbo, FX_STRIDE, 4, FX_VERTS);
-    CremaBufferCreateIndexU16(&fxIbo, 6, FX_TRIS);
-    CremaBufferCreateVertex(&hudVbo, HUD_STRIDE, 4, HUD_VERTS);
-    CremaBufferCreateIndexU16(&hudIbo, 6, FX_TRIS);   // same two triangles
 
     GX2Texture ground;
     CremaTextureCreate(&ground, GROUND_TEX, GROUND_TEX,
@@ -827,15 +684,6 @@ int main(int argc, char **argv)
     if (gVsEnemy < 0) gVsEnemy = 0;
     if (gPsEnemy < 0) gPsEnemy = 0;
     if (enemyLoc < 0) enemyLoc = 1;
-    int32_t gVsFx = CremaShaderVSBlockLocation(shFx, "Global");
-    int32_t fxLoc = CremaShaderVSBlockLocation(shFx, "Effects");
-    if (gVsFx < 0) gVsFx = 0;
-    if (fxLoc < 0) fxLoc = 1;
-    int32_t hudLoc = CremaShaderVSBlockLocation(shHud, "Hud");
-    if (hudLoc < 0) hudLoc = 0;
-    uint32_t fontUnit = 0;
-    if (shHud->ps->samplerVarCount > 0)
-        fontUnit = shHud->ps->samplerVars[0].location;
     uint32_t hullUnit = 0, groundUnit = 0, enemyUnit = 0;
     if (shShip->ps->samplerVarCount > 0)
         hullUnit = shShip->ps->samplerVars[0].location;
@@ -884,8 +732,11 @@ int main(int argc, char **argv)
     CremaEffect fxStorage[MAX_EFFECTS];
     CremaEffectPool fx;
     CremaEffectPoolInit(&fx, fxStorage, MAX_EFFECTS);
+    CremaUniformRing fxViewRing;
+    CremaUniformRingCreate(&fxViewRing, sizeof(CremaEffectView),
+                           CREMA_FRAMES_IN_FLIGHT);
     CremaUniformRing fxRing;
-    CremaUniformRingCreate(&fxRing, sizeof(float) * 4 * 2 * MAX_EFFECTS,
+    CremaUniformRingCreate(&fxRing, CREMA_EFFECT_BLOCK_BYTES,
                            CREMA_FRAMES_IN_FLIGHT);
 
     // Two HUD rings, because the two screens show different readouts and both
@@ -930,14 +781,9 @@ int main(int argc, char **argv)
     view.enemyLoc = enemyLoc;     view.enemyUnit = enemyUnit;
     view.enemyBytes = sizeof(float) * 4 * MAX_ENEMIES;
     view.enemyCount = 0;
-    view.shFx = shFx;             view.fxVbo = &fxVbo;   view.fxIbo = &fxIbo;
-    view.gVsFx = gVsFx;           view.fxLoc = fxLoc;
-    view.fxBytes = sizeof(float) * 4 * 2 * MAX_EFFECTS;
-    view.fxCount = 0;
-    view.shHud = shHud;           view.hudVbo = &hudVbo; view.hudIbo = &hudIbo;
-    view.hudLoc = hudLoc;         view.fontUnit = fontUnit;
-    view.font = &font;            view.fontSampler = &fontSampler;
-    view.hudBytes = HUD_BYTES;    view.hudCount = 0;     view.hudUbo = NULL;
+    view.fxRenderer  = &fxRenderer;   view.fxCount = 0;
+    view.hudRenderer = &hudRenderer;  view.hudCount = 0;  view.hudUbo = NULL;
+    view.font = &font;                view.fontSampler = &fontSampler;
 
     static const float SKY[4] = { 0.50f, 0.62f, 0.74f, 1.0f };
     static const float TACTICAL[4] = { 0.02f, 0.05f, 0.08f, 1.0f };
@@ -1190,10 +1036,6 @@ int main(int argc, char **argv)
         blk.groundOffset[1] = 0.0f;
         blk.groundOffset[2] = floorf(flight.pos.z / tile) * tile;
         blk.groundOffset[3] = 0.0f;
-        blk.camRight[0] = camRight.x; blk.camRight[1] = camRight.y;
-        blk.camRight[2] = camRight.z; blk.camRight[3] = 0.0f;
-        blk.camUp[0] = camUpAxis.x;   blk.camUp[1] = camUpAxis.y;
-        blk.camUp[2] = camUpAxis.z;   blk.camUp[3] = 0.0f;
         view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
 
         // pack the live enemies into the instance array, contiguously: the
@@ -1217,6 +1059,17 @@ int main(int argc, char **argv)
         float fxData[MAX_EFFECTS * 2][4];
         memset(fxData, 0, sizeof(fxData));
         uint32_t fxLive = CremaEffectPack(&fx, fxData, MAX_EFFECTS);
+        // The billboards get their own three numbers rather than reading this
+        // game's Global block, which has ten fields and is nobody else's
+        // business. Same renderer, same shader, two utterly different cameras.
+        CremaEffectView fxView;
+        fxView.viewProj = blk.viewProj;
+        fxView.camRight[0] = camRight.x; fxView.camRight[1] = camRight.y;
+        fxView.camRight[2] = camRight.z; fxView.camRight[3] = 0.0f;
+        fxView.camUp[0] = camUpAxis.x;   fxView.camUp[1] = camUpAxis.y;
+        fxView.camUp[2] = camUpAxis.z;   fxView.camUp[3] = 0.0f;
+        view.fxViewUbo = CremaUniformRingStore(&fxViewRing, slot, &fxView,
+                                               sizeof(fxView));
         view.fxUbo = CremaUniformRingStore(&fxRing, slot, fxData, sizeof(fxData));
         view.fxCount = fxLive;
 
@@ -1295,21 +1148,18 @@ int main(int argc, char **argv)
     CremaUniformRingDestroy(&hudRingDrc);
     CremaUniformRingDestroy(&hudRingTv);
     CremaUniformRingDestroy(&fxRing);
+    CremaUniformRingDestroy(&fxViewRing);
     CremaUniformRingDestroy(&enemyRing);
     CremaUniformRingDestroy(&globals);
     CremaUniformFreeBlock(formation);
-    CremaBufferDestroy(&hudIbo);
-    CremaBufferDestroy(&hudVbo);
-    CremaBufferDestroy(&fxIbo);
-    CremaBufferDestroy(&fxVbo);
+    CremaEffectRendererDestroy(&fxRenderer);
+    CremaHudRendererDestroy(&hudRenderer);
     CremaBufferDestroy(&groundIbo);
     CremaBufferDestroy(&groundVbo);
     CremaTextureDestroy(&ground);
     CremaTextureDestroy(&font);
     CremaTextureDestroy(&hull);
     CremaMeshDestroy(&ship);
-    CremaShaderFree(shHud);
-    CremaShaderFree(shFx);
     CremaShaderFree(shEnemy);
     CremaShaderFree(shGround);
     CremaShaderFree(shShip);

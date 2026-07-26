@@ -109,8 +109,6 @@ enum {
     "layout(binding = 0) uniform Global {\n" \
     "    mat4 uViewProj;\n" \
     "    vec4 uLightDir;\n"  \
-    "    vec4 uCamRight;\n"  \
-    "    vec4 uCamUp;\n"     \
     "    vec4 uTime;\n"      \
     "};\n"
 
@@ -168,96 +166,11 @@ static const char *PS_SHIP =
     "    oColor = vec4(base * (0.35 + 0.75 * diff), 1.0);\n"
     "}\n";
 
-// The billboard that draws a CremaEffect. Camera-facing, no texture: the blob
-// is computed from the corner coordinate, so an explosion costs no memory.
-static const char *VS_FX =
-    "#version 450\n"
-    "layout(location = 0) in vec2 aCorner;\n"
-    GLOBAL_UBO_DECL
-    "layout(binding = 1) uniform Effects {\n"
-    "    vec4 uFx[128];\n"
-    "};\n"
-    "layout(location = 0) out vec2 vCorner;\n"
-    "layout(location = 1) out vec4 vTint;\n"
-    "void main()\n"
-    "{\n"
-    "    vec4 ps  = uFx[gl_InstanceID * 2];\n"
-    "    vec4 col = uFx[gl_InstanceID * 2 + 1];\n"
-    "    vec3 world = ps.xyz + uCamRight.xyz * (aCorner.x * ps.w)\n"
-    "                        + uCamUp.xyz    * (aCorner.y * ps.w);\n"
-    "    gl_Position = uViewProj * vec4(world, 1.0);\n"
-    "    vCorner = aCorner;\n"
-    "    vTint = col;\n"
-    "}\n";
-
-static const char *PS_FX =
-    "#version 450\n"
-    "layout(location = 0) in vec2 vCorner;\n"
-    "layout(location = 1) in vec4 vTint;\n"
-    "layout(location = 0) out vec4 oColor;\n"
-    "void main()\n"
-    "{\n"
-    "    float falloff = 1.0 - smoothstep(0.15, 1.0, length(vCorner));\n"
-    "    oColor = vec4(vTint.rgb * falloff, vTint.a * falloff);\n"
-    "}\n";
-
-static const char *VS_HUD =
-    "#version 450\n"
-    "layout(location = 0) in vec2 aCorner;\n"
-    "layout(binding = 0) uniform Hud {\n"
-    "    vec4 uItem[512];\n"
-    "};\n"
-    "layout(location = 0) out vec2 vUV;\n"
-    "layout(location = 1) out vec4 vTint;\n"
-    "layout(location = 2) out float vSolid;\n"
-    "layout(location = 3) out vec4 vCell;\n"
-    "void main()\n"
-    "{\n"
-    "    vec4 it  = uItem[gl_InstanceID * 2];\n"
-    "    vec4 col = uItem[gl_InstanceID * 2 + 1];\n"
-    "    float solid = it.w < 0.0 ? 1.0 : 0.0;\n"
-    "    vec2 size = solid > 0.5 ? vec2(it.z, -it.w) : vec2(it.z, it.z);\n"
-    "    vec2 pos = it.xy + aCorner * size;\n"
-    "    gl_Position = vec4(pos.x / 640.0 - 1.0,\n"
-    "                       1.0 - pos.y / 360.0, 0.0, 1.0);\n"
-    "    float idx = max(it.w, 0.0);\n"
-    "    vec2 cell = vec2(mod(idx, 8.0), floor(idx * 0.125));\n"
-    "    vUV = (cell + aCorner) * 0.125;\n"
-    "    vCell = (vec4(cell, cell) * 16.0 + vec4(0.5, 0.5, 15.5, 15.5))\n"
-    "            * (1.0 / 128.0);\n"
-    "    vTint = col;\n"
-    "    vSolid = solid;\n"
-    "}\n";
-
-static const char *PS_HUD =
-    "#version 450\n"
-    "layout(location = 0) in vec2 vUV;\n"
-    "layout(location = 1) in vec4 vTint;\n"
-    "layout(location = 2) in float vSolid;\n"
-    "layout(location = 3) in vec4 vCell;\n"
-    "layout(binding = 0) uniform sampler2D uFont;\n"
-    "layout(location = 0) out vec4 oColor;\n"
-    "void main()\n"
-    "{\n"
-    "    vec2 uv = clamp(vUV, vCell.xy, vCell.zw);\n"
-    "    float mask = vSolid > 0.5 ? 1.0 : texture(uFont, uv).a;\n"
-    "    oColor = vec4(vTint.rgb, vTint.a * mask);\n"
-    "}\n";
-
 typedef struct {
     Mat4  viewProj;
     float lightDir[4];
-    float camRight[4];
-    float camUp[4];
     float time[4];
 } GlobalBlock;
-
-static const float QUAD_CENTRED[] = { -1.0f, -1.0f,  1.0f, -1.0f,
-                                       1.0f,  1.0f, -1.0f,  1.0f };
-static const float QUAD_CORNER[]  = {  0.0f,  0.0f,  1.0f,  0.0f,
-                                       1.0f,  1.0f,  0.0f,  1.0f };
-static const uint16_t QUAD_TRIS[] = { 0, 1, 2, 0, 2, 3 };
-#define QUAD_STRIDE (2 * sizeof(float))
 
 // --- the game ----------------------------------------------------------------
 
@@ -521,16 +434,20 @@ static void updatePlay(Game *g, const CremaInput *in, const Sfx *sfx, float dt)
 // --- rendering ---------------------------------------------------------------
 
 typedef struct {
-    const CremaShader *shShip, *shFx, *shHud;
+    const CremaShader *shShip;
     const CremaMesh   *mesh;
     const GX2Texture  *hull, *font;
     const GX2Sampler  *sampler;
-    uint32_t hullUnit, fontUnit;
-    int32_t  gVs, gPs, instLoc, gVsFx, fxLoc, hudLoc;
-    const void *globalUbo, *instUbo, *fxUbo, *hudUbo;
-    size_t   instBytes, fxBytes, hudBytes;
+    uint32_t hullUnit;
+    int32_t  gVs, gPs, instLoc;
+    const void *globalUbo, *instUbo, *fxViewUbo, *fxUbo, *hudUbo;
+    size_t   instBytes;
     uint32_t instCount, fxCount, hudCount;
-    GX2RBuffer *quadCentred, *quadCorner, *quadIbo;
+
+    // The two renderers that used to be spelled out here. What is left in this
+    // file is the one shader this game actually invented.
+    const CremaEffectRenderer *fxRenderer;
+    const CremaHudRenderer    *hudRenderer;
 } View;
 
 static void drawWorld(void *user)
@@ -549,34 +466,8 @@ static void drawWorld(void *user)
         CremaMeshDraw(v->mesh, v->instCount);
     }
 
-    if (v->fxCount > 0) {
-        CremaBlendSet(CREMA_BLEND_ADDITIVE);
-        CremaDepthSet(true, false);
-        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
-        CremaShaderBind(v->shFx);
-        GX2SetVertexUniformBlock(v->gVsFx, sizeof(GlobalBlock), v->globalUbo);
-        GX2SetVertexUniformBlock(v->fxLoc, v->fxBytes, v->fxUbo);
-        GX2RSetAttributeBuffer(v->quadCentred, 0, QUAD_STRIDE, 0);
-        GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, v->quadIbo,
-                        GX2_INDEX_TYPE_U16, 6, 0, 0, v->fxCount);
-        CremaBlendSet(CREMA_BLEND_OPAQUE);
-        CremaDepthSet(true, true);
-    }
-
-    if (v->hudCount > 0) {
-        CremaBlendSet(CREMA_BLEND_ALPHA);
-        CremaDepthSet(false, false);
-        GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
-        CremaShaderBind(v->shHud);
-        GX2SetVertexUniformBlock(v->hudLoc, v->hudBytes, v->hudUbo);
-        GX2SetPixelTexture(v->font, v->fontUnit);
-        GX2SetPixelSampler(v->sampler, v->fontUnit);
-        GX2RSetAttributeBuffer(v->quadCorner, 0, QUAD_STRIDE, 0);
-        GX2RDrawIndexed(GX2_PRIMITIVE_MODE_TRIANGLES, v->quadIbo,
-                        GX2_INDEX_TYPE_U16, 6, 0, 0, v->hudCount);
-        CremaBlendSet(CREMA_BLEND_OPAQUE);
-        CremaDepthSet(true, true);
-    }
+    CremaEffectDraw(v->fxRenderer, v->fxViewUbo, v->fxUbo, v->fxCount);
+    CremaHudDraw(v->hudRenderer, v->hudUbo, v->hudCount, v->font, v->sampler);
 }
 
 static uint32_t packInstances(const Game *g, float (*out)[4], uint32_t max)
@@ -719,14 +610,14 @@ int main(int argc, char **argv)
     // unity, and this one has more shots on screen, not fewer.
     CremaAudioSetHeadroom(0.40f);
 
-    const CremaAttrib quadAttrib[] = {
-        { 0, 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32 },
-    };
+    // The only shader this game had to write. The other two came with the
+    // framework, which is what the previous half hour of work bought.
     CremaShader *shShip = CremaShaderCompile(VS_SHIP, PS_SHIP,
                                              ship.attribs, ship.attribCount);
-    CremaShader *shFx   = CremaShaderCompile(VS_FX, PS_FX, quadAttrib, 1);
-    CremaShader *shHud  = CremaShaderCompile(VS_HUD, PS_HUD, quadAttrib, 1);
-    if (!shShip || !shFx || !shHud) {
+    CremaEffectRenderer fxRenderer;
+    CremaHudRenderer    hudRenderer;
+    if (!shShip || !CremaEffectRendererCreate(&fxRenderer) ||
+        !CremaHudRendererCreate(&hudRenderer)) {
         WHBLogPrintf("[poc12] shader compile failed");
         CremaShaderShutdownCompiler();
         CremaAudioShutdown();
@@ -734,50 +625,36 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    GX2RBuffer quadCentred, quadCorner, quadIbo;
-    CremaBufferCreateVertex(&quadCentred, QUAD_STRIDE, 4, QUAD_CENTRED);
-    CremaBufferCreateVertex(&quadCorner,  QUAD_STRIDE, 4, QUAD_CORNER);
-    CremaBufferCreateIndexU16(&quadIbo, 6, QUAD_TRIS);
-
     GX2Sampler sampler;
     CremaSamplerInitTrilinear(&sampler, GX2_TEX_CLAMP_MODE_WRAP);
 
     View view;
     memset(&view, 0, sizeof(view));
-    view.shShip = shShip;   view.shFx = shFx;   view.shHud = shHud;
+    view.shShip = shShip;
     view.mesh = &ship;      view.hull = &hull;  view.font = &font;
     view.sampler = &sampler;
-    view.quadCentred = &quadCentred;
-    view.quadCorner  = &quadCorner;
-    view.quadIbo     = &quadIbo;
+    view.fxRenderer  = &fxRenderer;
+    view.hudRenderer = &hudRenderer;
     view.gVs     = CremaShaderVSBlockLocation(shShip, "Global");
     view.gPs     = CremaShaderPSBlockLocation(shShip, "Global");
     view.instLoc = CremaShaderVSBlockLocation(shShip, "Instances");
-    view.gVsFx   = CremaShaderVSBlockLocation(shFx, "Global");
-    view.fxLoc   = CremaShaderVSBlockLocation(shFx, "Effects");
-    view.hudLoc  = CremaShaderVSBlockLocation(shHud, "Hud");
     if (view.gVs < 0)     view.gVs = 0;
     if (view.gPs < 0)     view.gPs = 0;
     if (view.instLoc < 0) view.instLoc = 1;
-    if (view.gVsFx < 0)   view.gVsFx = 0;
-    if (view.fxLoc < 0)   view.fxLoc = 1;
-    if (view.hudLoc < 0)  view.hudLoc = 0;
     if (shShip->ps->samplerVarCount > 0)
         view.hullUnit = shShip->ps->samplerVars[0].location;
-    if (shHud->ps->samplerVarCount > 0)
-        view.fontUnit = shHud->ps->samplerVars[0].location;
 
     const size_t INST_BYTES = sizeof(float) * 4 * 2 * MAX_INSTANCES;
-    const size_t FX_BYTES   = sizeof(float) * 4 * 2 * MAX_EFFECTS;
-    const size_t HUD_BYTES  = sizeof(float) * 4 * 2 * HUD_MAX_ITEMS;
-    CremaUniformRing globals, instances, effects, hudRing;
+    CremaUniformRing globals, instances, fxViews, effects, hudRing;
     CremaUniformRingCreate(&globals,   sizeof(GlobalBlock), CREMA_FRAMES_IN_FLIGHT);
     CremaUniformRingCreate(&instances, INST_BYTES, CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&effects,   FX_BYTES,   CREMA_FRAMES_IN_FLIGHT);
-    CremaUniformRingCreate(&hudRing,   HUD_BYTES,  CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&fxViews,   sizeof(CremaEffectView),
+                           CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&effects,   CREMA_EFFECT_BLOCK_BYTES,
+                           CREMA_FRAMES_IN_FLIGHT);
+    CremaUniformRingCreate(&hudRing,   CREMA_HUD_BLOCK_BYTES,
+                           CREMA_FRAMES_IN_FLIGHT);
     view.instBytes = INST_BYTES;
-    view.fxBytes   = FX_BYTES;
-    view.hudBytes  = HUD_BYTES;
 
     static Game game;
     memset(&game, 0, sizeof(game));
@@ -877,27 +754,34 @@ int main(int argc, char **argv)
         blk.viewProj = viewProj;
         blk.lightDir[0] = lightDir.x; blk.lightDir[1] = lightDir.y;
         blk.lightDir[2] = lightDir.z; blk.lightDir[3] = 0.0f;
-        // the camera is fixed, so its basis is a constant — but the billboard
-        // shader still wants it, and computing it here keeps that shader the
-        // same one a moving camera would use
-        blk.camRight[0] = 1.0f; blk.camRight[1] = 0.0f;
-        blk.camRight[2] = 0.0f; blk.camRight[3] = 0.0f;
-        blk.camUp[0] = 0.0f;    blk.camUp[1] = cosf(camPitch);
-        blk.camUp[2] = -sinf(camPitch); blk.camUp[3] = 0.0f;
         blk.time[0] = clock.elapsed;
         blk.time[1] = blk.time[2] = blk.time[3] = 0.0f;
         view.globalUbo = CremaUniformRingStore(&globals, slot, &blk, sizeof(blk));
+
+        // The billboards ask for three numbers of their own rather than reading
+        // this game's Global block, which is what lets the same renderer serve
+        // a shooter whose camera never moves and a flight demo whose camera
+        // never stops. The camera here being fixed, its basis is a constant.
+        CremaEffectView fxView;
+        fxView.viewProj = viewProj;
+        fxView.camRight[0] = 1.0f; fxView.camRight[1] = 0.0f;
+        fxView.camRight[2] = 0.0f; fxView.camRight[3] = 0.0f;
+        fxView.camUp[0] = 0.0f;    fxView.camUp[1] = cosf(camPitch);
+        fxView.camUp[2] = -sinf(camPitch); fxView.camUp[3] = 0.0f;
+        view.fxViewUbo = CremaUniformRingStore(&fxViews, slot, &fxView,
+                                               sizeof(fxView));
 
         view.instCount = packInstances(&game, instData, MAX_INSTANCES);
         view.instUbo   = CremaUniformRingStore(&instances, slot, instData,
                                                INST_BYTES);
         view.fxCount   = CremaEffectPack(&game.fx, fxData, MAX_EFFECTS);
-        view.fxUbo     = CremaUniformRingStore(&effects, slot, fxData, FX_BYTES);
+        view.fxUbo     = CremaUniformRingStore(&effects, slot, fxData,
+                                               CREMA_EFFECT_BLOCK_BYTES);
 
         buildHud(&game, &hud);
         view.hudCount = hud.count;
         view.hudUbo   = CremaUniformRingStore(&hudRing, slot, hud.items,
-                                              HUD_BYTES);
+                                              CREMA_HUD_BLOCK_BYTES);
 
         CremaFrameDrawBoth(SPACE, drawWorld, &view);
         CremaFrameEnd(&frame, &stats);
@@ -915,17 +799,15 @@ int main(int argc, char **argv)
     CremaBankClose(&bank);
     CremaUniformRingDestroy(&globals);
     CremaUniformRingDestroy(&instances);
+    CremaUniformRingDestroy(&fxViews);
     CremaUniformRingDestroy(&effects);
     CremaUniformRingDestroy(&hudRing);
-    CremaBufferDestroy(&quadCentred);
-    CremaBufferDestroy(&quadCorner);
-    CremaBufferDestroy(&quadIbo);
+    CremaEffectRendererDestroy(&fxRenderer);
+    CremaHudRendererDestroy(&hudRenderer);
     CremaMeshDestroy(&ship);
     CremaTextureDestroy(&hull);
     CremaTextureDestroy(&font);
     CremaShaderFree(shShip);
-    CremaShaderFree(shFx);
-    CremaShaderFree(shHud);
     CremaShaderShutdownCompiler();
     CremaAudioShutdown();
     CremaAppShutdown();

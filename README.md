@@ -8,15 +8,22 @@
 Crema is a small, honest layer: runtime GLSL shaders, cache-safe resource
 handling, frame pacing, an audio stack that treats AX as what it is, and the
 hard-earned lessons of getting GX2 code from the Cemu emulator onto real
-silicon. It ships with twelve progressive examples, each one verified on real
+silicon. It ships with thirteen progressive examples, each one verified on real
 hardware — a flyable game at 59.9 fps with the CPU idle and an engine note that
-follows the throttle, and a shoot-'em-up you can actually lose.
+follows the throttle, a shoot-'em-up you can actually lose, and a slice of a
+role-playing game whose field is still standing where you left it when the
+battle ends.
 
-It started as a rendering framework and the word has quietly stopped being
-true; it is not an engine yet either, but of the two things that were standing
-between it and that word, one has gone: **it can save now** — the shoot-'em-up's
-high score survives the power going off. What is still missing is a name for the
-other one: nothing here knows what a scene is.
+It started as a rendering framework and the word has quietly stopped being true.
+It is still not called an engine here, and that is now a decision rather than a
+gap. Both of the things that were named as standing in the way have gone: **it
+can save** — a high score survives the power going off — and **it knows what a
+scene is**, which is a lifetime and not a game state, verified by two different
+games. What is deliberately not being claimed is that this has been *asked*
+enough. Every example so far draws, shoots or walks; none of them has wanted a
+ball to bounce or a net to be see-through. A word earned by a checklist is worth
+less than one earned by something new refusing to fit, so the next slice comes
+first.
 
 Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
 
@@ -81,6 +88,14 @@ Every byte is home-grown (MIT). No SDK leaks, no foreign engine code.
   with a magic, a version the *caller* owns, and a checksum, replaced by writing
   elsewhere and renaming so that losing power costs the new save and not the old
   one. Not `nn_save`, and that is a decision with a reason — see below
+- **crema_scene** — a stack of places, which is what a game state is not: states
+  share everything and are never entered or left, and a scene is a *lifetime*.
+  Three operations, and the difference between two of them is measured rather
+  than argued — pushing a battle over a field costs 0.5 ms and no GPU drain,
+  rebuilding that field costs 12 ms and a 3.6 ms drain, so `push` is not a way
+  to keep the previous picture but the difference between suspending a place and
+  paying to build it again. It knows nothing about how a transition *looks*: a
+  request is only parked, and the caller applies it when its own fade says so
 - **crema_music** — the sequencer, ticking on AX's audio frame (3 ms) instead
   of on the game loop, and never allocating there: channels reserve their
   voices up front, and a note-on re-aims a voice the channel already owns
@@ -110,6 +125,32 @@ while (CremaAppRunning()) {
 }
 ```
 
+A game with more than one place is the same loop with the scene stack put where
+the drawing was, and one line added at the bottom — this is
+[poc12](examples/poc12-shmup/main.cpp) after its four game states became four
+scenes:
+
+```c
+while (CremaAppRunning()) {
+    CremaClockTick(&clock);
+    CremaInputPoll(&input);
+    CremaSceneUpdate(&app.stack, &input, clock.dt);   // the top of the stack only
+
+    uint32_t slot = CremaFrameBegin(&frame);
+    CremaSceneBuild(&app.stack, slot);                // every visible scene
+    CremaFrameDrawBoth(CremaSceneClearColor(&app.stack), CremaSceneDraw,
+                       &app.stack);
+    CremaFrameEnd(&frame, &stats);
+
+    CremaSceneApply(&app.stack, &frame);   // the one place a scene may come or go
+}
+```
+
+That last line is after the swap on purpose, and it is the whole of what makes
+scene changes safe: the frame is submitted, so nothing will read the outgoing
+scene's uniform slices again, and the GPU can be drained before its memory is
+handed back.
+
 ## The examples (`examples/`)
 
 | # | Example | What it proves | Real-HW result |
@@ -125,7 +166,8 @@ while (CremaAppRunning()) {
 | 9 | `poc9-scene` | the pieces assembled: fly-cam scene, mipmapped ground, fog, instancing, TV+DRC | 59.94 fps, 0.00 ms CPU sync |
 | 10 | `poc10-mesh` | the asset pipeline: baked mesh + texture loaded from the .wuhb, instanced squadron, per-pixel lit — and the same two assets loaded twice, loose and packed, to measure the difference | 59.9 fps, 356 KB in 38.95 ms loose vs **32.33 ms from one .cpak** |
 | 11 | `poc11-flight` | a game, not a demo: arcade flight model, chase camera, free wingmen, hostiles you can shoot, a HUD with the GamePad running its own tactical screen, an engine note that rides the throttle, and a chip tune sequenced on the audio thread | 60 fps, CPU idle |
-| 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves, a record that survives the power going off — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs | 59.9 fps, 0.00 ms sync, save 1.1 ms |
+| 12 | `poc12-shmup` | a game you can lose: title screen, pause, three lives, score, waves, a record that survives the power going off — and written from an empty file to find out which of PoC 11's parts a *different* game actually needs. Its four game states were later rewritten as four scenes, which is what made `crema_scene` more than one example's preference | 59.9 fps, 0.00 ms sync, save **47 ms on console** |
+| 13 | `poc13-quest` | a slice of a role-playing game, and the first thing here with two places: a field you walk, a battle pushed on top of it that leaves the field standing, a see-through status menu, a journal on the card and a hero who comes back to where they stood | 59.9 fps, 0.00 ms sync, **no frame dropped by any scene change** |
 
 To our knowledge these are the first published GX2 polygon/fill throughput
 numbers measured from homebrew on real hardware.
@@ -783,6 +825,14 @@ The cost of the extraction, measured: PoC 11 lost 150 lines, PoC 12 lost 118,
 59.9 fps, 0.00 ms sync, the echo still 12-13 µs. What is left in each example is
 the one shader that game actually invented.
 
+PoC 13 was written the same way, from an empty file, and it is worth recording
+that the rule paid twice over — because the second time it ran *backwards*. The
+shoot-'em-up asked a question of the flight demo and got modules out of it; the
+role-playing slice asked a question nothing had asked before, wrote its own
+answer in the example, and then the **shoot-'em-up** was rewritten onto it to see
+whether the answer was a shape or a preference. A witness is a witness in either
+direction, and the one written first is the harder one to have bent.
+
 ### Saving, and where a homebrew title is allowed to put a file
 
 The shoot-'em-up had a "BEST" line on its HUD that was a lie the moment you
@@ -831,6 +881,55 @@ to read** them. Slow enough to be worth doing once per game over rather than onc
 per point scored, and nowhere near slow enough to need a thread. That is the sort
 of thing worth measuring precisely because both answers were plausible.
 
+> **Corrected on 2026-07-26 by PoC 13, on the console.** The two numbers above are
+> the emulator's, and the emulator is wrong about this by a factor of forty. On
+> real hardware the same call — twenty-four bytes this time — costs **42 ms
+> typically, and 209 ms the first time it replaced a file left by a previous
+> run**. Reading is 2.1–4.4 ms against Cemu's 0.4. The 42 ms is visible in the
+> frame log as exactly one dropped frame every time; the 209 ms as **twelve**.
+>
+> Most of it is shape rather than bytes: a write is `fopen`, `fwrite`, `fclose`,
+> `remove` and `rename` — five calls, four of them filesystem metadata, each a
+> round trip through FSA — and the flush at the end is an SD card being
+> programmed. The 209 ms outlier is very probably the card erasing a block it
+> had already written, the slowest thing it does, and it happened once.
+>
+> The conclusion survives, but only by luck and only for PoC 12: saving **at a
+> game over** is free because the picture has already stopped. PoC 13 saves on a
+> button while the player is still walking, and there the hitch is real and you
+> can feel it — it was noticed on the television before it was found in the log.
+> A game that wants to save mid-play either wears one dropped frame or wants
+> another thread, and `crema_save` will grow one when an example needs it and not
+> before.
+>
+> Two notes on why this is not the emergency it first looks like, both of which
+> came from Samuele on seeing the hitch. The first is that the fast storage is
+> exactly the one a homebrew of this shape cannot reach: the console's internal
+> eMMC is almost certainly better at a small write than a removable FAT32 card
+> whose controller may have to erase a block it had already programmed — and
+> `/vol/save` belongs to the host title, so that is not a lever, it is the
+> explanation of why the constraint bites.
+>
+> The second is the useful one, and it closes a circle with the scene work on the
+> same day. Real games do not offer flying saves; they put the save behind a menu
+> that has already stopped the picture. **That menu is a scene** — and being a
+> scene is precisely what makes the cost free, because everything underneath is
+> suspended and a dropped frame has nothing left to drop. PoC 12 had stumbled
+> into the same answer by saving at a game over, which is the same idea stated
+> worse.
+>
+> And a third, found on the television and not in the log: **whether the hitch is
+> visible depends on which way you are walking.** PoC 13's ground has a worn
+> track through it, which the generator lays down as a band of constant X — so
+> the lines run north-south. Walk north and you move *along* them: the picture is
+> invariant under translation on its own axis, and a dropped frame has no edge to
+> jump. Walk east and you move *across* them, every high-contrast boundary
+> lurches, and the same 42 ms is obvious. Same number in the frame log, 58.9 fps,
+> for two things that do not look remotely alike. It is the reason a panning shot
+> judders at the cinema and a dolly-in does not, and it is worth writing down
+> because it means the frame counter cannot answer "will anyone notice" — only a
+> screen can.
+
 Two fields rather than one, on purpose. A high score alone is indistinguishable
 from a single word written to a file; the thing worth proving is that a *struct*
 goes out and comes back with its parts still in the right order. So there is a
@@ -838,9 +937,9 @@ play counter too, and it is on the title screen — a number that is not zero on
 fresh boot is a number that came from a file.
 
 ```
-[save] ready at /vol/external01/wiiu/apps/gx2poc
-[poc12] no record yet in /vol/external01/wiiu/apps/gx2poc (193 us)
-[poc12] record saved: best 14100, 1 games, 1114 us
+[save] ready at /vol/external01/wiiu/apps/gx2poc          # in Cemu — see the
+[poc12] no record yet in /vol/external01/wiiu/apps/gx2poc (193 us)   # note above
+[poc12] record saved: best 14100, 1 games, 1114 us        # on console: ~47000 us
 ...
 [poc12] record loaded from /vol/external01/wiiu/apps/gx2poc: best 14100 after 5 games, 402 us
 ```
@@ -929,6 +1028,68 @@ What is left is honest bandwidth: of the 32 ms, 21.8 is 355 KB arriving at
 gone, so the only lever remaining is moving fewer bytes — which is compression,
 a different piece of work with a different trade.
 
+### A scene is a lifetime, and a state is not
+
+PoC 12 had four game states in a `switch` and they worked. They shared every
+resource, none was ever entered or left, and nothing was loaded or freed when
+one became another — which is exactly right for a game that is **one place**.
+PoC 13 is a role-playing slice, and the moment a game has two places the
+question stops being *what is happening* and becomes *what is alive*.
+
+Three operations, and what separates two of them is a measurement rather than an
+opinion. Taken on the console:
+
+| | GPU drain | leave | enter |
+|---|---|---|---|
+| `push` a battle over the field | **0** | 0 | 0.5–0.8 ms |
+| `push` a see-through status menu | **0** | 0 | 6–8 µs |
+| `pop` back to the field | 3.6–3.9 ms | 1–2 µs | 0 |
+| `goto` the field from the title | 3.6 ms | 1 µs | **10.8–12.5 ms** |
+
+So `push` is not a convenience for keeping the previous picture. Walking into a
+monster suspends the field and walking out of the battle resumes it, and the
+alternative — rebuilding the field, with its procedural texture and nine
+synchronous mip uploads — is twenty times dearer, *every fight*. The drain is
+needed only by the operations that hand memory back, which is why an overlay
+opens instantly and a change of place is worth hiding behind a fade.
+
+Two hardware notes on the numbers. `GX2DrawDone` at the switch is **3.6–5.8 ms
+on the console against 0.4 ms in Cemu**, ten times, and the emulator is not to be
+believed about it. And **none of it dropped a frame** — 59.9 fps through every
+switch in both games, because the pacing leaves the CPU idle and the switch runs
+after the frame has been submitted. The only thing in either game that costs a
+frame is writing the save file.
+
+What the module deliberately does not know is how a transition *looks*: PoC 13
+fades through black and PoC 12's transitions are instant, so a request is only
+parked and the caller applies it when its own fade says so. There is no timer in
+`crema_scene`.
+
+**And then it had to survive a second caller.** PoC 12's four states were
+rewritten as four scenes — the test that mattered, because they were written long
+before there was a shape to fit them to. `crema_scene.h` was not edited to make
+them fit, and three things fell out:
+
+- **`enter`/`leave` are not only about memory.** The pause ducks the music going
+  in and lifts it coming out. Those were two lines at opposite ends of a `switch`
+  with nothing saying they were a pair.
+- **The readout and the announcement are different lists.** Score, record and
+  lives belong to the round; "PAUSED" belongs to the thing on top of it. Not
+  tidying — both lists are in flight in the same frame, so each must own its
+  uniform slice. The same rule `crema_hud` had already found.
+- **What keeps moving under an overlay is the game's call.** A suspended scene is
+  suspended completely, so the pause freezes the explosions for free; the
+  game-over screen, which wants them to finish burning, ticks that pool itself
+  from on top. One line, and it replaced `if (state != STATE_PAUSED)
+  CremaEffectUpdate(...)` — code that had to name the state it was *not* in.
+
+One cost, stated plainly because not every extraction is a win: **the rewrite
+made PoC 12 longer**, 885 lines to 1106. Extracting the HUD had shortened PoC 11
+by 150. Four scenes with a struct and five callbacks each are more code than a
+`switch` on an `int`, and for a game that is one place the `switch` was genuinely
+better. The shape earns its keep when there are two places with different
+lifetimes.
+
 ## Lessons learned (Cemu vs real hardware)
 
 Found the hard way, roughly one per PoC. If you write GX2 code, this list is the
@@ -940,9 +1101,10 @@ have. It is not, and the later ones are worth reading for the difference. Some
 are questions **neither** machine answers, because the answer is policy rather
 than behaviour (9, 10). One is a case where nothing was going wrong anywhere and
 only a PC render could tell (11). Two were found **by ear**, by a person, and no
-number any build printed came near them (12, 13) — which is the most useful thing
-on this list if you are writing audio, because it means the measurements you have
-chosen to print define what you are able to notice.
+number any build printed came near them (12, 13). And one was found **by eye**
+(16), where the build printed the same number for two things that do not look
+alike at all — which is the most useful idea on this list, because it means the
+measurements you have chosen to print define what you are able to notice.
 
 1. **`GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK)`** is required on
    hardware for CafeGLSL shaders; Cemu renders without it.
@@ -1018,6 +1180,26 @@ chosen to print define what you are able to notice.
    exactly that state and uses them. A loop back to sample 0 (where the
    encoder's own history was silence) barely differs; a loop into the middle of
    a sample would.
+15. **Waiting is the thing Cemu is worst at, and it is not close.** Writing
+   twenty-four bytes to the SD costs **42 ms on the console** — 209 ms the first
+   time it replaces a file an earlier run left there — against 1.1 ms in the
+   emulator. `GX2DrawDone` costs 3.6-5.8 ms against 0.4. Neither is a subtle
+   difference and both are the same cause: the emulator does not have a card to
+   program or a GPU to wait for, so anything whose cost *is* the waiting comes
+   out forty times too cheap. A save is five calls, four of them filesystem
+   metadata through FSA, and the last one flushes to a removable card that may
+   have to erase a block it had already written. Budget it as one to twelve
+   dropped frames — or put it behind a screen that has already stopped moving,
+   which is what every real game does and is the reason a save menu is a scene.
+16. **Whether a dropped frame is visible depends on which way things are
+   moving.** The same 42 ms save, in the same game, on the same television: walk
+   north across a ground whose worn tracks run north-south and it is barely
+   there, because the picture is invariant under translation along its own
+   stripes and a lost frame has no edge to jump. Walk east, across them, and it
+   lurches. Identical in the frame log — 58.9 fps both times — for two things
+   that do not look remotely alike. It is why a pan judders at the cinema and a
+   dolly-in does not, and the practical form of it is blunt: **the frame counter
+   cannot answer "will anyone notice".** Only a screen can.
 
 Also: front faces are **CCW seen from outside** with culling on, and tiled
 textures (`GX2_TILE_MODE_DEFAULT`, GPU-swizzled from a linear staging copy)
@@ -1073,6 +1255,14 @@ compiler entirely (the Immaterial demo pattern).
   entirely by the baker. Which makes audio memory a compile-time decision rather
   than a runtime trade — 96 KB of instruments became 47 with two of eleven
   compressed.
+- Storage is the slow thing, by a wide margin, and the only one here that costs
+  frames: **42 ms to write** a two-dozen-byte save to the SD (209 ms once, first
+  overwrite of a file from an earlier run), **2-4 ms to read** it. `GX2DrawDone`
+  is **3.6-5.8 ms**. Everything on this list except these is free at 60 Hz.
+- Changing scene is not: pushing one over another costs **0.5-0.8 ms and no
+  drain**, and rebuilding a place from nothing — procedural texture, mip chain,
+  buffers, five uniform rings — costs **12 ms**. Neither dropped a frame, because
+  the CPU has ~16 ms of idle per frame and the switch runs after submission.
 - Engine recipe that gets you there: static vertex/uniform data, animation in
   the vertex shader, instancing, fenced pacing — CPU cost ≈ 0.1 ms/frame.
 
